@@ -128,6 +128,10 @@ struct nvmet_ns {
 	u8			csi;
 	struct nvmet_pr		pr;
 	struct xarray		pr_per_ctrl_refs;
+
+	/* Memory backend support */
+	struct xarray		mem_pages;
+	u64			mem_nr_pages;  /* Protected by mem_pages xa_lock */
 };
 
 static inline struct nvmet_ns *to_nvmet_ns(struct config_item *item)
@@ -706,14 +710,18 @@ bool nvmet_host_allowed(struct nvmet_subsys *subsys, const char *hostnqn);
 
 int nvmet_bdev_ns_enable(struct nvmet_ns *ns);
 int nvmet_file_ns_enable(struct nvmet_ns *ns);
+int nvmet_mem_ns_enable(struct nvmet_ns *ns);
 void nvmet_bdev_ns_disable(struct nvmet_ns *ns);
 void nvmet_file_ns_disable(struct nvmet_ns *ns);
+void nvmet_mem_ns_disable(struct nvmet_ns *ns);
 u16 nvmet_bdev_flush(struct nvmet_req *req);
 u16 nvmet_file_flush(struct nvmet_req *req);
 void nvmet_ns_changed(struct nvmet_subsys *subsys, u32 nsid);
 void nvmet_bdev_ns_revalidate(struct nvmet_ns *ns);
 void nvmet_file_ns_revalidate(struct nvmet_ns *ns);
+void nvmet_mem_ns_revalidate(struct nvmet_ns *ns);
 bool nvmet_ns_revalidate(struct nvmet_ns *ns);
+u16 nvmet_mem_parse_io_cmd(struct nvmet_req *req);
 u16 blk_to_nvme_status(struct nvmet_req *req, blk_status_t blk_sts);
 
 bool nvmet_bdev_zns_enable(struct nvmet_ns *ns);

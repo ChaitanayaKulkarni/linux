@@ -535,6 +535,66 @@ out_unlock:
 
 CONFIGFS_ATTR(nvmet_ns_, device_path);
 
+static ssize_t nvmet_ns_mem_size_show(struct config_item *item, char *page)
+{
+	struct nvmet_ns *ns = to_nvmet_ns(item);
+
+	/* Only show size for memory-backed namespaces */
+	if (ns->device_path)
+		return sprintf(page, "0\n");
+
+	return sprintf(page, "%llu\n", ns->size);
+}
+
+static ssize_t nvmet_ns_mem_size_store(struct config_item *item,
+				       const char *page, size_t count)
+{
+	struct nvmet_ns *ns = to_nvmet_ns(item);
+	struct nvmet_subsys *subsys = ns->subsys;
+	u64 new_size, max_size;
+	int ret;
+
+	ret = kstrtou64(page, 0, &new_size);
+	if (ret)
+		return ret;
+
+	mutex_lock(&subsys->lock);
+
+	/* Only allow for memory-backed namespaces */
+	if (ns->device_path) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	/* Can only change size when namespace is disabled */
+	if (ns->enabled) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	if (new_size == 0) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	/* Limit to 80% of total system memory */
+	max_size = ((u64)totalram_pages() * 80 / 100) << PAGE_SHIFT;
+	if (new_size > max_size) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	ns->size = new_size;
+	mutex_unlock(&subsys->lock);
+	return count;
+
+out_unlock:
+	mutex_unlock(&subsys->lock);
+	return ret;
+}
+
+CONFIGFS_ATTR(nvmet_ns_, mem_size);
+
 #ifdef CONFIG_PCI_P2PDMA
 static ssize_t nvmet_ns_p2pmem_show(struct config_item *item, char *page)
 {
@@ -800,6 +860,7 @@ CONFIGFS_ATTR(nvmet_ns_, resv_enable);
 
 static struct configfs_attribute *nvmet_ns_attrs[] = {
 	&nvmet_ns_attr_device_path,
+	&nvmet_ns_attr_mem_size,
 	&nvmet_ns_attr_device_nguid,
 	&nvmet_ns_attr_device_uuid,
 	&nvmet_ns_attr_ana_grpid,

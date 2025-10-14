@@ -467,6 +467,7 @@ static void nvmet_ns_dev_disable(struct nvmet_ns *ns)
 {
 	nvmet_bdev_ns_disable(ns);
 	nvmet_file_ns_disable(ns);
+	nvmet_mem_ns_disable(ns);
 }
 
 static int nvmet_p2pmem_ns_enable(struct nvmet_ns *ns)
@@ -557,8 +558,10 @@ bool nvmet_ns_revalidate(struct nvmet_ns *ns)
 
 	if (ns->bdev)
 		nvmet_bdev_ns_revalidate(ns);
-	else
+	else if (ns->file)
 		nvmet_file_ns_revalidate(ns);
+	else
+		nvmet_mem_ns_revalidate(ns);
 
 	return oldsize != ns->size;
 }
@@ -580,9 +583,14 @@ int nvmet_ns_enable(struct nvmet_ns *ns)
 	if (ns->enabled)
 		goto out_unlock;
 
-	ret = nvmet_bdev_ns_enable(ns);
-	if (ret == -ENOTBLK)
-		ret = nvmet_file_ns_enable(ns);
+	/* Memory backend if no device_path is set */
+	if (!ns->device_path) {
+		ret = nvmet_mem_ns_enable(ns);
+	} else {
+		ret = nvmet_bdev_ns_enable(ns);
+		if (ret == -ENOTBLK)
+			ret = nvmet_file_ns_enable(ns);
+	}
 	if (ret)
 		goto out_unlock;
 
@@ -1121,8 +1129,10 @@ static u16 nvmet_parse_io_cmd(struct nvmet_req *req)
 	case NVME_CSI_NVM:
 		if (req->ns->file)
 			ret = nvmet_file_parse_io_cmd(req);
-		else
+		else if (req->ns->bdev)
 			ret = nvmet_bdev_parse_io_cmd(req);
+		else
+			ret = nvmet_mem_parse_io_cmd(req);
 		break;
 	case NVME_CSI_ZNS:
 		if (IS_ENABLED(CONFIG_BLK_DEV_ZONED))
