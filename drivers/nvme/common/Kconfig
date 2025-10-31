@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+config NVME_COMMON_BUILT_IN
+	bool
+
 config NVME_KEYRING
        tristate
        select KEYS
 
-config NVME_AUTH
-	tristate
+config NVME_AUTH_STATE
+	bool "NVMe over Fabrics In-Band Authentication"
+	depends on NVME_CORE != n || NVME_TARGET != n
 	select CRYPTO
 	select CRYPTO_HMAC
 	select CRYPTO_SHA256
@@ -14,3 +18,13 @@ config NVME_AUTH
 	select CRYPTO_DH_RFC7919_GROUPS
 	select CRYPTO_HKDF
 	select NVME_KEYRING
+	help
+	  This provides support for NVMe over Fabrics In-Band Authentication.
+
+	  If unsure, say N.
+
+config NVME_AUTH
+	tristate
+	depends on NVME_AUTH_STATE
+	default y if NVME_COMMON_BUILT_IN
+	default m

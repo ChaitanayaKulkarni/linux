@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config NVME_CORE
 	tristate
+	select NVME_COMMON_BUILT_IN if NVME_CORE = y
 
 config BLK_DEV_NVME
 	tristate "NVM Express block device"
@@ -112,14 +113,9 @@ config NVME_TCP_TLS
 	  If unsure, say N.
 
 config NVME_HOST_AUTH
-	bool "NVMe over Fabrics In-Band Authentication in host side"
+	bool
 	depends on NVME_CORE
-	select NVME_AUTH
-	help
-	  This provides support for NVMe over Fabrics In-Band Authentication in
-	  host side.
-
-	  If unsure, say N.
+	default NVME_AUTH_STATE
 
 config NVME_APPLE
 	tristate "Apple ANS2 NVM Express host driver"

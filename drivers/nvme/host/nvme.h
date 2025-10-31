@@ -1179,8 +1179,6 @@ int nvme_auth_negotiate(struct nvme_ctrl *ctrl, int qid);
 int nvme_auth_wait(struct nvme_ctrl *ctrl, int qid);
 void nvme_auth_free(struct nvme_ctrl *ctrl);
 void nvme_auth_revoke_tls_key(struct nvme_ctrl *ctrl);
-struct key *nvme_auth_extract_key(struct key *keyring, const u8 *secret,
-				  size_t secret_len, bool *generated);
 #else
 static inline int nvme_auth_init_ctrl(struct nvme_ctrl *ctrl)
 {
@@ -1204,13 +1202,6 @@ static inline int nvme_auth_wait(struct nvme_ctrl *ctrl, int qid)
 }
 static inline void nvme_auth_free(struct nvme_ctrl *ctrl) {};
 static inline void nvme_auth_revoke_tls_key(struct nvme_ctrl *ctrl) {};
-static inline struct key *nvme_auth_extract_key(struct key *keyring,
-						const u8 *secret,
-						size_t secret_len,
-						bool *generated)
-{
-	return ERR_PTR(-ENOKEY);
-}
 #endif
 
 u32 nvme_command_effects(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
