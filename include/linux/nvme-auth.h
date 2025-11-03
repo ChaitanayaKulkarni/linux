@@ -18,7 +18,7 @@ const char *nvme_auth_digest_name(u8 hmac_id);
 size_t nvme_auth_hmac_hash_len(u8 hmac_id);
 u8 nvme_auth_hmac_id(const char *hmac_name);
 
-#ifdef CONFIG_NVME_AUTH
+#ifdef CONFIG_NVME_AUTH_STATE
 struct key *nvme_auth_extract_key(struct key *keyring, const u8 *secret,
 				  size_t secret_len, bool *generated);
 #else

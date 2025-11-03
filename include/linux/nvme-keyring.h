@@ -54,7 +54,7 @@ static inline struct key *nvme_dhchap_psk_lookup(struct key *keyring,
 {
 	return ERR_PTR(-ENOTSUPP);
 }
-u8 nvme_dhchap_psk_hash(struct key *key)
+static inline u8 nvme_dhchap_psk_hash(struct key *key)
 {
 	return 0;
 }
