@@ -458,7 +458,8 @@ anon_pipe_write(struct kiocb *iocb, struct iov_iter *from)
 	mutex_lock(&pipe->mutex);
 
 	if (!pipe->readers) {
-		send_sig(SIGPIPE, current, 0);
+		if ((iocb->ki_flags & IOCB_NOSIGNAL) == 0)
+			send_sig(SIGPIPE, current, 0);
 		ret = -EPIPE;
 		goto out;
 	}
@@ -498,7 +499,8 @@ anon_pipe_write(struct kiocb *iocb, struct iov_iter *from)
 
 	for (;;) {
 		if (!pipe->readers) {
-			send_sig(SIGPIPE, current, 0);
+			if ((iocb->ki_flags & IOCB_NOSIGNAL) == 0)
+				send_sig(SIGPIPE, current, 0);
 			if (!ret)
 				ret = -EPIPE;
 			break;
@@ -906,7 +908,7 @@ static struct inode * get_pipe_inode(void)
 	 * list because "mark_inode_dirty()" will think
 	 * that it already _is_ on the dirty list.
 	 */
-	inode->i_state = I_DIRTY;
+	inode_state_assign_raw(inode, I_DIRTY);
 	inode->i_mode = S_IFIFO | S_IRUSR | S_IWUSR;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();

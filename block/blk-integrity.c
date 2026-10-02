@@ -58,16 +58,14 @@ new_segment:
 int blk_get_meta_cap(struct block_device *bdev, unsigned int cmd,
 		     struct logical_block_metadata_cap __user *argp)
 {
-	struct blk_integrity *bi = blk_get_integrity(bdev->bd_disk);
+	struct blk_integrity *bi;
 	struct logical_block_metadata_cap meta_cap = {};
 	size_t usize = _IOC_SIZE(cmd);
 
-	if (_IOC_DIR(cmd)  != _IOC_DIR(FS_IOC_GETLBMD_CAP) ||
-	    _IOC_TYPE(cmd) != _IOC_TYPE(FS_IOC_GETLBMD_CAP) ||
-	    _IOC_NR(cmd)   != _IOC_NR(FS_IOC_GETLBMD_CAP) ||
-	    _IOC_SIZE(cmd) < LBMD_SIZE_VER0)
+	if (!extensible_ioctl_valid(cmd, FS_IOC_GETLBMD_CAP, LBMD_SIZE_VER0))
 		return -ENOIOCTLCMD;
 
+	bi = blk_get_integrity(bdev->bd_disk);
 	if (!bi)
 		goto out;
 
@@ -142,14 +140,21 @@ EXPORT_SYMBOL_GPL(blk_rq_integrity_map_user);
 bool blk_integrity_merge_rq(struct request_queue *q, struct request *req,
 			    struct request *next)
 {
+	struct bio_integrity_payload *bip, *bip_next;
+
 	if (blk_integrity_rq(req) == 0 && blk_integrity_rq(next) == 0)
 		return true;
 
 	if (blk_integrity_rq(req) == 0 || blk_integrity_rq(next) == 0)
 		return false;
 
-	if (bio_integrity(req->bio)->bip_flags !=
-	    bio_integrity(next->bio)->bip_flags)
+	bip = bio_integrity(req->bio);
+	bip_next = bio_integrity(next->bio);
+	if (bip->bip_flags != bip_next->bip_flags)
+		return false;
+
+	if (bip->bip_flags & BIP_CHECK_APPTAG &&
+	    bip->app_tag != bip_next->app_tag)
 		return false;
 
 	if (req->nr_integrity_segments + next->nr_integrity_segments >
@@ -165,15 +170,21 @@ bool blk_integrity_merge_rq(struct request_queue *q, struct request *req,
 bool blk_integrity_merge_bio(struct request_queue *q, struct request *req,
 			     struct bio *bio)
 {
+	struct bio_integrity_payload *bip, *bip_bio = bio_integrity(bio);
 	int nr_integrity_segs;
 
-	if (blk_integrity_rq(req) == 0 && bio_integrity(bio) == NULL)
+	if (blk_integrity_rq(req) == 0 && bip_bio == NULL)
 		return true;
 
-	if (blk_integrity_rq(req) == 0 || bio_integrity(bio) == NULL)
+	if (blk_integrity_rq(req) == 0 || bip_bio == NULL)
 		return false;
 
-	if (bio_integrity(req->bio)->bip_flags != bio_integrity(bio)->bip_flags)
+	bip = bio_integrity(req->bio);
+	if (bip->bip_flags != bip_bio->bip_flags)
+		return false;
+
+	if (bip->bip_flags & BIP_CHECK_APPTAG &&
+	    bip->app_tag != bip_bio->app_tag)
 		return false;
 
 	nr_integrity_segs = blk_rq_count_integrity_sg(q, bio);

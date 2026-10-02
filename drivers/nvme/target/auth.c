@@ -20,90 +20,54 @@
 
 #include "nvmet.h"
 
-void nvmet_auth_revoke_key(struct nvmet_host *host, bool set_ctrl)
-{
-	struct key *key = ERR_PTR(-ENOKEY);
-	bool generated = false;
-
-	if (set_ctrl) {
-		if (host->dhchap_ctrl_key) {
-			key = host->dhchap_ctrl_key;
-			generated = host->dhchap_ctrl_key_generated;
-			host->dhchap_ctrl_key = NULL;
-			host->dhchap_ctrl_key_generated = false;
-		}
-	} else {
-		if (host->dhchap_key) {
-			key = host->dhchap_key;
-			generated = host->dhchap_key_generated;
-			host->dhchap_key = NULL;
-			host->dhchap_key_generated = false;
-		}
-	}
-	if (!IS_ERR(key)) {
-		if (generated) {
-			pr_debug("%s: revoke %s key %08x\n",
-				 __func__, set_ctrl ? "ctrl" : "host",
-				 key_serial(key));
-			key_revoke(key);
-			synchronize_rcu();
-		}
-		pr_debug("%s: drop %s key %08x\n",
-			 __func__, set_ctrl ? "ctrl" : "host",
-			 key_serial(key));
-		key_put(key);
-	}
-}
-
 int nvmet_auth_set_key(struct nvmet_host *host, const char *secret,
 		       bool set_ctrl)
 {
 	unsigned char key_hash;
-	bool generated = false;
-	struct key *key;
-	size_t len;
+	char *dhchap_secret;
 
 	if (!strlen(secret)) {
-		nvmet_auth_revoke_key(host, set_ctrl);
+		if (set_ctrl) {
+			kfree(host->dhchap_ctrl_secret);
+			host->dhchap_ctrl_secret = NULL;
+			host->dhchap_ctrl_key_hash = 0;
+		} else {
+			kfree(host->dhchap_secret);
+			host->dhchap_secret = NULL;
+			host->dhchap_key_hash = 0;
+		}
 		return 0;
 	}
-
-	len = strcspn(secret, "\n");
-	key = nvme_auth_extract_key(host->dhchap_keyring, secret, len, &generated);
-	if (IS_ERR(key)) {
-		pr_debug("%s: invalid key specification\n", __func__);
-		return PTR_ERR(key);
+	if (sscanf(secret, "DHHC-1:%hhd:%*s", &key_hash) != 1)
+		return -EINVAL;
+	if (key_hash > 3) {
+		pr_warn("Invalid DH-HMAC-CHAP hash id %d\n",
+			 key_hash);
+		return -EINVAL;
 	}
-	down_read(&key->sem);
-	if (key_validate(key)) {
-		pr_warn("%s: key %08x invalidated\n",
-			__func__, key_serial(key));
-		up_read(&key->sem);
-		key_put(key);
-		return -EKEYREVOKED;
-	}
-
-	key_hash = nvme_dhchap_psk_hash(key);
 	if (key_hash > 0) {
 		/* Validate selected hash algorithm */
 		const char *hmac = nvme_auth_hmac_name(key_hash);
 
 		if (!crypto_has_shash(hmac, 0, 0)) {
 			pr_err("DH-HMAC-CHAP hash %s unsupported\n", hmac);
-			up_read(&key->sem);
-			key_put(key);
 			return -ENOTSUPP;
 		}
 	}
-	up_read(&key->sem);
-	nvmet_auth_revoke_key(host, set_ctrl);
+	dhchap_secret = kstrdup(secret, GFP_KERNEL);
+	if (!dhchap_secret)
+		return -ENOMEM;
+	down_write(&nvmet_config_sem);
 	if (set_ctrl) {
-		host->dhchap_ctrl_key = key;
-		host->dhchap_ctrl_key_generated = generated;
+		kfree(host->dhchap_ctrl_secret);
+		host->dhchap_ctrl_secret = strim(dhchap_secret);
+		host->dhchap_ctrl_key_hash = key_hash;
 	} else {
-		host->dhchap_key = key;
-		host->dhchap_key_generated = generated;
+		kfree(host->dhchap_secret);
+		host->dhchap_secret = strim(dhchap_secret);
+		host->dhchap_key_hash = key_hash;
 	}
+	up_write(&nvmet_config_sem);
 	return 0;
 }
 
@@ -181,8 +145,6 @@ u8 nvmet_setup_auth(struct nvmet_ctrl *ctrl, struct nvmet_sq *sq)
 	int ret = 0;
 	struct nvmet_host_link *p;
 	struct nvmet_host *host = NULL;
-	struct key *key;
-	key_serial_t key_id;
 
 	down_read(&nvmet_config_sem);
 	if (nvmet_is_disc_subsys(ctrl->subsys))
@@ -216,7 +178,7 @@ u8 nvmet_setup_auth(struct nvmet_ctrl *ctrl, struct nvmet_sq *sq)
 		goto out_unlock;
 	}
 
-	if (!host->dhchap_key) {
+	if (!host->dhchap_secret) {
 		pr_debug("No authentication provided\n");
 		goto out_unlock;
 	}
@@ -228,68 +190,46 @@ u8 nvmet_setup_auth(struct nvmet_ctrl *ctrl, struct nvmet_sq *sq)
 		ctrl->shash_id = host->dhchap_hash_id;
 	}
 
-	key = key_get(host->dhchap_key);
-	if (!key) {
-		pr_warn("%s: host key %08x not found\n",
-			 __func__, key_serial(host->dhchap_key));
+	/* Skip the 'DHHC-1:XX:' prefix */
+	nvme_auth_free_key(ctrl->host_key);
+	ctrl->host_key = nvme_auth_extract_key(host->dhchap_secret + 10,
+					       host->dhchap_key_hash);
+	if (IS_ERR(ctrl->host_key)) {
+		ret = NVME_AUTH_DHCHAP_FAILURE_NOT_USABLE;
+		ctrl->host_key = NULL;
+		goto out_free_hash;
+	}
+	pr_debug("%s: using hash %s key %*ph\n", __func__,
+		 ctrl->host_key->hash > 0 ?
+		 nvme_auth_hmac_name(ctrl->host_key->hash) : "none",
+		 (int)ctrl->host_key->len, ctrl->host_key->key);
+
+	nvme_auth_free_key(ctrl->ctrl_key);
+	if (!host->dhchap_ctrl_secret) {
+		ctrl->ctrl_key = NULL;
 		goto out_unlock;
 	}
-	down_read(&key->sem);
-	ret = key_validate(key);
-	if (!ret) {
+
+	ctrl->ctrl_key = nvme_auth_extract_key(host->dhchap_ctrl_secret + 10,
+					       host->dhchap_ctrl_key_hash);
+	if (IS_ERR(ctrl->ctrl_key)) {
+		ret = NVME_AUTH_DHCHAP_FAILURE_NOT_USABLE;
+		ctrl->ctrl_key = NULL;
+		goto out_free_hash;
+	}
+	pr_debug("%s: using ctrl hash %s key %*ph\n", __func__,
+		 ctrl->ctrl_key->hash > 0 ?
+		 nvme_auth_hmac_name(ctrl->ctrl_key->hash) : "none",
+		 (int)ctrl->ctrl_key->len, ctrl->ctrl_key->key);
+
+out_free_hash:
+	if (ret) {
 		if (ctrl->host_key) {
-			pr_debug("%s: drop host key %08x\n",
-				 __func__, key_serial(ctrl->host_key));
-			key_put(ctrl->host_key);
+			nvme_auth_free_key(ctrl->host_key);
+			ctrl->host_key = NULL;
 		}
-		ctrl->host_key = key;
+		ctrl->shash_id = 0;
 	}
-	key_id = key_serial(key);
-	up_read(&key->sem);
-	if (ret) {
-		pr_debug("key id %08x invalidated\n", key_id);
-		key_put(key);
-		key = ERR_PTR(-EKEYREVOKED);
-	}
-	pr_debug("%s: using dhchap hash %s key %08x\n", __func__,
-		 nvme_auth_hmac_name(ctrl->shash_id), key_id);
-
-	if (!host->dhchap_ctrl_key) {
-		if (ctrl->ctrl_key) {
-			pr_debug("%s: drop ctrl key %08x\n",
-				 __func__, key_serial(ctrl->ctrl_key));
-			key_put(ctrl->ctrl_key);
-			ctrl->ctrl_key = NULL;
-		}
-		goto out_unlock;
-	}
-
-	key = key_get(host->dhchap_ctrl_key);
-	if (!key) {
-		pr_warn("%s: ctrl key %08x not found\n",
-			__func__, key_serial(host->dhchap_ctrl_key));
-		goto out_unlock;
-	}
-	down_read(&key->sem);
-	ret = key_validate(key);
-	if (!ret) {
-		if (ctrl->ctrl_key) {
-			pr_debug("%s: drop ctrl key %08x\n",
-				 __func__, key_serial(ctrl->ctrl_key));
-			key_put(ctrl->ctrl_key);
-		}
-		ctrl->ctrl_key = key;
-	}
-	key_id = key_serial(key);
-	up_read(&key->sem);
-	if (ret) {
-		pr_debug("ctrl key id %08x invalidated\n", key_id);
-		key_put(key);
-		goto out_unlock;
-	}
-	pr_debug("%s: using dhchap ctrl hash %s key %08x\n", __func__,
-		 nvme_auth_hmac_name(ctrl->shash_id), key_id);
-
 out_unlock:
 	up_read(&nvmet_config_sem);
 
@@ -323,15 +263,11 @@ void nvmet_destroy_auth(struct nvmet_ctrl *ctrl)
 	ctrl->dh_key = NULL;
 
 	if (ctrl->host_key) {
-		pr_debug("%s: drop host key %08x\n",
-			 __func__, key_serial(ctrl->host_key));
-		key_put(ctrl->host_key);
+		nvme_auth_free_key(ctrl->host_key);
 		ctrl->host_key = NULL;
 	}
 	if (ctrl->ctrl_key) {
-		pr_debug("%s: drop ctrl key %08x\n",
-			 __func__, key_serial(ctrl->ctrl_key));
-		key_put(ctrl->ctrl_key);
+		nvme_auth_free_key(ctrl->ctrl_key);
 		ctrl->ctrl_key = NULL;
 	}
 #ifdef CONFIG_NVME_TARGET_TCP_TLS
@@ -361,8 +297,7 @@ int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	const char *hash_name;
 	u8 *challenge = req->sq->dhchap_c1;
-	u8 *transformed_secret;
-	size_t transformed_len;
+	struct nvme_dhchap_key *transformed_key;
 	u8 buf[4];
 	int ret;
 
@@ -386,14 +321,15 @@ int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
 		goto out_free_tfm;
 	}
 
-	ret = nvme_auth_transform_key(ctrl->host_key, ctrl->hostnqn,
-				      &transformed_secret);
-	if (ret < 0)
+	transformed_key = nvme_auth_transform_key(ctrl->host_key,
+						  ctrl->hostnqn);
+	if (IS_ERR(transformed_key)) {
+		ret = PTR_ERR(transformed_key);
 		goto out_free_tfm;
+	}
 
-	transformed_len = ret;
-	ret = crypto_shash_setkey(shash_tfm, transformed_secret,
-				  transformed_len);
+	ret = crypto_shash_setkey(shash_tfm, transformed_key->key,
+				  transformed_key->len);
 	if (ret)
 		goto out_free_response;
 
@@ -431,13 +367,14 @@ int nvmet_auth_host_hash(struct nvmet_req *req, u8 *response,
 	ret = crypto_shash_update(shash, buf, 2);
 	if (ret)
 		goto out;
-	memset(buf, 0, 4);
+	*buf = req->sq->sc_c;
 	ret = crypto_shash_update(shash, buf, 1);
 	if (ret)
 		goto out;
 	ret = crypto_shash_update(shash, "HostHost", 8);
 	if (ret)
 		goto out;
+	memset(buf, 0, 4);
 	ret = crypto_shash_update(shash, ctrl->hostnqn, strlen(ctrl->hostnqn));
 	if (ret)
 		goto out;
@@ -453,7 +390,7 @@ out:
 	if (challenge != req->sq->dhchap_c1)
 		kfree(challenge);
 out_free_response:
-	kfree(transformed_secret);
+	nvme_auth_free_key(transformed_key);
 out_free_tfm:
 	crypto_free_shash(shash_tfm);
 	return ret;
@@ -467,8 +404,7 @@ int nvmet_auth_ctrl_hash(struct nvmet_req *req, u8 *response,
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	const char *hash_name;
 	u8 *challenge = req->sq->dhchap_c2;
-	u8 *transformed_secret;
-	size_t transformed_len;
+	struct nvme_dhchap_key *transformed_key;
 	u8 buf[4];
 	int ret;
 
@@ -492,14 +428,15 @@ int nvmet_auth_ctrl_hash(struct nvmet_req *req, u8 *response,
 		goto out_free_tfm;
 	}
 
-	ret = nvme_auth_transform_key(ctrl->ctrl_key, ctrl->subsys->subsysnqn,
-				      &transformed_secret);
-	if (ret < 0)
+	transformed_key = nvme_auth_transform_key(ctrl->ctrl_key,
+						ctrl->subsys->subsysnqn);
+	if (IS_ERR(transformed_key)) {
+		ret = PTR_ERR(transformed_key);
 		goto out_free_tfm;
-	transformed_len = ret;
+	}
 
-	ret = crypto_shash_setkey(shash_tfm, transformed_secret,
-				  transformed_len);
+	ret = crypto_shash_setkey(shash_tfm, transformed_key->key,
+				  transformed_key->len);
 	if (ret)
 		goto out_free_response;
 
@@ -564,7 +501,7 @@ out_free_challenge:
 	if (challenge != req->sq->dhchap_c2)
 		kfree(challenge);
 out_free_response:
-	kfree(transformed_secret);
+	nvme_auth_free_key(transformed_key);
 out_free_tfm:
 	crypto_free_shash(shash_tfm);
 	return ret;
@@ -653,8 +590,10 @@ void nvmet_auth_insert_psk(struct nvmet_sq *sq)
 		goto out_free_digest;
 	}
 #ifdef CONFIG_NVME_TARGET_TCP_TLS
-	tls_key = nvme_tls_psk_refresh(NULL, sq->ctrl->hostnqn, sq->ctrl->subsys->subsysnqn,
-				       sq->ctrl->shash_id, tls_psk, psk_len, digest);
+	tls_key = nvme_tls_psk_refresh(NULL, sq->ctrl->hostnqn,
+				       sq->ctrl->subsys->subsysnqn,
+				       sq->ctrl->shash_id, tls_psk, psk_len,
+				       digest);
 	if (IS_ERR(tls_key)) {
 		pr_warn("%s: ctrl %d qid %d failed to refresh key, error %ld\n",
 			__func__, sq->ctrl->cntlid, sq->qid, PTR_ERR(tls_key));

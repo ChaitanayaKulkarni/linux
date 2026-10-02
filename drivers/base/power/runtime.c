@@ -90,7 +90,7 @@ static void update_pm_runtime_accounting(struct device *dev)
 	/*
 	 * Because ktime_get_mono_fast_ns() is not monotonic during
 	 * timekeeping updates, ensure that 'now' is after the last saved
-	 * timesptamp.
+	 * timestamp.
 	 */
 	if (now < last)
 		return;
@@ -217,7 +217,7 @@ static int dev_memalloc_noio(struct device *dev, void *data)
  *     resume/suspend callback of any one of its ancestors(or the
  *     block device itself), the deadlock may be triggered inside the
  *     memory allocation since it might not complete until the block
- *     device becomes active and the involed page I/O finishes. The
+ *     device becomes active and the involved page I/O finishes. The
  *     situation is pointed out first by Alan Stern. Network device
  *     are involved in iSCSI kind of situation.
  *
@@ -497,6 +497,9 @@ static int rpm_idle(struct device *dev, int rpmflags)
 	retval = rpm_check_suspend_allowed(dev);
 	if (retval < 0)
 		;	/* Conditions are wrong. */
+
+	else if ((rpmflags & RPM_GET_PUT) && retval == 1)
+		;	/* put() is allowed in RPM_SUSPENDED */
 
 	/* Idle notifications are allowed only in the RPM_ACTIVE state. */
 	else if (dev->power.runtime_status != RPM_ACTIVE)
@@ -796,6 +799,8 @@ static int rpm_resume(struct device *dev, int rpmflags)
 		if (dev->power.runtime_status == RPM_ACTIVE &&
 		    dev->power.last_status == RPM_ACTIVE)
 			retval = 1;
+		else if (rpmflags & RPM_TRANSPARENT)
+			goto out;
 		else
 			retval = -EACCES;
 	}
@@ -1205,7 +1210,7 @@ EXPORT_SYMBOL_GPL(__pm_runtime_resume);
  *
  * Otherwise, if its runtime PM status is %RPM_ACTIVE and (1) @ign_usage_count
  * is set, or (2) @dev is not ignoring children and its active child count is
- * nonero, or (3) the runtime PM usage counter of @dev is not zero, increment
+ * nonzero, or (3) the runtime PM usage counter of @dev is not zero, increment
  * the usage counter of @dev and return 1.
  *
  * Otherwise, return 0 without changing the usage counter.
@@ -1659,9 +1664,12 @@ EXPORT_SYMBOL_GPL(devm_pm_runtime_get_noresume);
  * pm_runtime_forbid - Block runtime PM of a device.
  * @dev: Device to handle.
  *
- * Increase the device's usage count and clear its power.runtime_auto flag,
- * so that it cannot be suspended at run time until pm_runtime_allow() is called
- * for it.
+ * Resume @dev if already suspended and block runtime suspend of @dev in such
+ * a way that it can be unblocked via the /sys/devices/.../power/control
+ * interface, or otherwise by calling pm_runtime_allow().
+ *
+ * Calling this function many times in a row has the same effect as calling it
+ * once.
  */
 void pm_runtime_forbid(struct device *dev)
 {
@@ -1682,7 +1690,13 @@ EXPORT_SYMBOL_GPL(pm_runtime_forbid);
  * pm_runtime_allow - Unblock runtime PM of a device.
  * @dev: Device to handle.
  *
- * Decrease the device's usage count and set its power.runtime_auto flag.
+ * Unblock runtime suspend of @dev after it has been blocked by
+ * pm_runtime_forbid() (for instance, if it has been blocked via the
+ * /sys/devices/.../power/control interface), check if @dev can be
+ * suspended and suspend it in that case.
+ *
+ * Calling this function many times in a row has the same effect as calling it
+ * once.
  */
 void pm_runtime_allow(struct device *dev)
 {
@@ -1903,8 +1917,7 @@ void pm_runtime_get_suppliers(struct device *dev)
 
 	idx = device_links_read_lock();
 
-	list_for_each_entry_rcu(link, &dev->links.suppliers, c_node,
-				device_links_read_lock_held())
+	dev_for_each_link_to_supplier(link, dev)
 		if (device_link_test(link, DL_FLAG_PM_RUNTIME)) {
 			link->supplier_preactivated = true;
 			pm_runtime_get_sync(link->supplier);

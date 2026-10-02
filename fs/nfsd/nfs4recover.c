@@ -92,24 +92,10 @@ nfs4_reset_creds(const struct cred *original)
 	put_cred(revert_creds(original));
 }
 
-static void
-md5_to_hex(char *out, char *md5)
-{
-	int i;
-
-	for (i=0; i<16; i++) {
-		unsigned char c = md5[i];
-
-		*out++ = '0' + ((c&0xf0)>>4) + (c>=0xa0)*('a'-'9'-1);
-		*out++ = '0' + (c&0x0f) + ((c&0x0f)>=0x0a)*('a'-'9'-1);
-	}
-	*out = '\0';
-}
-
 static int
-nfs4_make_rec_clidname(char *dname, const struct xdr_netobj *clname)
+nfs4_make_rec_clidname(char dname[HEXDIR_LEN], const struct xdr_netobj *clname)
 {
-	struct xdr_netobj cksum;
+	u8 digest[MD5_DIGEST_SIZE];
 	struct crypto_shash *tfm;
 	int status;
 
@@ -121,23 +107,16 @@ nfs4_make_rec_clidname(char *dname, const struct xdr_netobj *clname)
 		goto out_no_tfm;
 	}
 
-	cksum.len = crypto_shash_digestsize(tfm);
-	cksum.data = kmalloc(cksum.len, GFP_KERNEL);
-	if (cksum.data == NULL) {
-		status = -ENOMEM;
- 		goto out;
-	}
-
 	status = crypto_shash_tfm_digest(tfm, clname->data, clname->len,
-					 cksum.data);
+					 digest);
 	if (status)
 		goto out;
 
-	md5_to_hex(dname, cksum.data);
+	static_assert(HEXDIR_LEN == 2 * MD5_DIGEST_SIZE + 1);
+	sprintf(dname, "%*phN", MD5_DIGEST_SIZE, digest);
 
 	status = 0;
 out:
-	kfree(cksum.data);
 	crypto_free_shash(tfm);
 out_no_tfm:
 	return status;
@@ -216,13 +195,11 @@ nfsd4_create_clid_dir(struct nfs4_client *clp)
 		goto out_creds;
 
 	dir = nn->rec_file->f_path.dentry;
-	/* lock the parent */
-	inode_lock(d_inode(dir));
 
-	dentry = lookup_one(&nop_mnt_idmap, &QSTR(dname), dir);
+	dentry = start_creating(&nop_mnt_idmap, dir, &QSTR(dname));
 	if (IS_ERR(dentry)) {
 		status = PTR_ERR(dentry);
-		goto out_unlock;
+		goto out;
 	}
 	if (d_really_is_positive(dentry))
 		/*
@@ -233,15 +210,13 @@ nfsd4_create_clid_dir(struct nfs4_client *clp)
 		 * In the 4.0 case, we should never get here; but we may
 		 * as well be forgiving and just succeed silently.
 		 */
-		goto out_put;
-	dentry = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), dentry, S_IRWXU);
+		goto out_end;
+	dentry = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), dentry, 0700, NULL);
 	if (IS_ERR(dentry))
 		status = PTR_ERR(dentry);
-out_put:
-	if (!status)
-		dput(dentry);
-out_unlock:
-	inode_unlock(d_inode(dir));
+out_end:
+	end_creating(dentry);
+out:
 	if (status == 0) {
 		if (nn->in_grace)
 			__nfsd4_create_reclaim_record_grace(clp, dname,
@@ -349,20 +324,12 @@ nfsd4_unlink_clid_dir(char *name, struct nfsd_net *nn)
 	dprintk("NFSD: nfsd4_unlink_clid_dir. name %s\n", name);
 
 	dir = nn->rec_file->f_path.dentry;
-	inode_lock_nested(d_inode(dir), I_MUTEX_PARENT);
-	dentry = lookup_one(&nop_mnt_idmap, &QSTR(name), dir);
-	if (IS_ERR(dentry)) {
-		status = PTR_ERR(dentry);
-		goto out_unlock;
-	}
-	status = -ENOENT;
-	if (d_really_is_negative(dentry))
-		goto out;
-	status = vfs_rmdir(&nop_mnt_idmap, d_inode(dir), dentry);
-out:
-	dput(dentry);
-out_unlock:
-	inode_unlock(d_inode(dir));
+	dentry = start_removing(&nop_mnt_idmap, dir, &QSTR(name));
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+
+	status = vfs_rmdir(&nop_mnt_idmap, d_inode(dir), dentry, NULL);
+	end_removing(dentry);
 	return status;
 }
 
@@ -448,7 +415,7 @@ purge_old(struct dentry *parent, struct dentry *child, struct nfsd_net *nn)
 	if (nfs4_has_reclaimed_state(name, nn))
 		goto out_free;
 
-	status = vfs_rmdir(&nop_mnt_idmap, d_inode(parent), child);
+	status = vfs_rmdir(&nop_mnt_idmap, d_inode(parent), child, NULL);
 	if (status)
 		printk("failed to remove client recovery directory %pd\n",
 				child);

@@ -35,6 +35,7 @@
 /* selinuxfs pseudo filesystem for exporting the security policy API.
    Based on the proc code and the fs/nfsd/nfsctl.c code. */
 
+#include "initcalls.h"
 #include "flask.h"
 #include "avc.h"
 #include "avc_ss.h"
@@ -506,6 +507,7 @@ static int sel_make_policy_nodes(struct selinux_fs_info *fsi,
 {
 	int ret = 0;
 	struct dentry *tmp_parent, *tmp_bool_dir, *tmp_class_dir;
+	struct renamedata rd = {};
 	unsigned int bool_num = 0;
 	char **bool_names = NULL;
 	int *bool_values = NULL;
@@ -539,9 +541,14 @@ static int sel_make_policy_nodes(struct selinux_fs_info *fsi,
 	if (ret)
 		goto out;
 
-	lock_rename(tmp_parent, fsi->sb->s_root);
+	rd.old_parent = tmp_parent;
+	rd.new_parent = fsi->sb->s_root;
 
 	/* booleans */
+	ret = start_renaming_two_dentries(&rd, tmp_bool_dir, fsi->bool_dir);
+	if (ret)
+		goto out;
+
 	d_exchange(tmp_bool_dir, fsi->bool_dir);
 
 	swap(fsi->bool_num, bool_num);
@@ -549,12 +556,17 @@ static int sel_make_policy_nodes(struct selinux_fs_info *fsi,
 	swap(fsi->bool_pending_values, bool_values);
 
 	fsi->bool_dir = tmp_bool_dir;
+	end_renaming(&rd);
 
 	/* classes */
+	ret = start_renaming_two_dentries(&rd, tmp_class_dir, fsi->class_dir);
+	if (ret)
+		goto out;
+
 	d_exchange(tmp_class_dir, fsi->class_dir);
 	fsi->class_dir = tmp_class_dir;
 
-	unlock_rename(tmp_parent, fsi->sb->s_root);
+	end_renaming(&rd);
 
 out:
 	sel_remove_old_bool_data(bool_num, bool_names, bool_values);
@@ -1203,7 +1215,7 @@ static ssize_t sel_read_bool(struct file *filep, char __user *buf,
 			     size_t count, loff_t *ppos)
 {
 	struct selinux_fs_info *fsi = file_inode(filep)->i_sb->s_fs_info;
-	char *page = NULL;
+	char buffer[4];
 	ssize_t length;
 	ssize_t ret;
 	int cur_enforcing;
@@ -1217,27 +1229,19 @@ static ssize_t sel_read_bool(struct file *filep, char __user *buf,
 					     fsi->bool_pending_names[index]))
 		goto out_unlock;
 
-	ret = -ENOMEM;
-	page = (char *)get_zeroed_page(GFP_KERNEL);
-	if (!page)
-		goto out_unlock;
-
 	cur_enforcing = security_get_bool_value(index);
 	if (cur_enforcing < 0) {
 		ret = cur_enforcing;
 		goto out_unlock;
 	}
-	length = scnprintf(page, PAGE_SIZE, "%d %d", cur_enforcing,
-			  fsi->bool_pending_values[index]);
+	length = scnprintf(buffer, sizeof(buffer), "%d %d", !!cur_enforcing,
+			  !!fsi->bool_pending_values[index]);
 	mutex_unlock(&selinux_state.policy_mutex);
-	ret = simple_read_from_buffer(buf, count, ppos, page, length);
-out_free:
-	free_page((unsigned long)page);
-	return ret;
+	return simple_read_from_buffer(buf, count, ppos, buffer, length);
 
 out_unlock:
 	mutex_unlock(&selinux_state.policy_mutex);
-	goto out_free;
+	return ret;
 }
 
 static ssize_t sel_write_bool(struct file *filep, const char __user *buf,
@@ -2130,7 +2134,7 @@ static struct file_system_type sel_fs_type = {
 
 struct path selinux_null __ro_after_init;
 
-static int __init init_sel_fs(void)
+int __init init_sel_fs(void)
 {
 	struct qstr null_name = QSTR_INIT(NULL_FILE_NAME,
 					  sizeof(NULL_FILE_NAME)-1);
@@ -2174,5 +2178,3 @@ static int __init init_sel_fs(void)
 
 	return err;
 }
-
-__initcall(init_sel_fs);
