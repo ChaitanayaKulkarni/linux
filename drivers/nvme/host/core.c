@@ -3691,6 +3691,7 @@ static int nvme_init_identify(struct nvme_ctrl *ctrl)
 	ctrl->kas = le16_to_cpu(id->kas);
 	ctrl->max_namespaces = le32_to_cpu(id->mnan);
 	ctrl->ctratt = le32_to_cpu(id->ctratt);
+	ctrl->cdl_supported = !!(ctrl->ctratt & NVME_CTRL_CTRATT_CDLSUPP);
 
 	ctrl->cntrltype = id->cntrltype;
 	ctrl->dctype = id->dctype;
