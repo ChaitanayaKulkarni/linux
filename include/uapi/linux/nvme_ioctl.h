@@ -92,6 +92,15 @@ struct nvme_uring_cmd {
 	__u32   rsvd2;
 };
 
+/* Versioned host metadata, never encoded in an NVMe I/O command. */
+struct nvme_passthru_cmd64_prio {
+	__u32 size;
+	__u16 version;
+	__u16 ioprio;
+	struct nvme_passthru_cmd64 cmd;
+	__aligned_u64 reserved;
+};
+
 #define nvme_admin_cmd nvme_passthru_cmd
 
 #define NVME_IOCTL_ID		_IO('N', 0x40)
@@ -104,6 +113,9 @@ struct nvme_uring_cmd {
 #define NVME_IOCTL_ADMIN64_CMD	_IOWR('N', 0x47, struct nvme_passthru_cmd64)
 #define NVME_IOCTL_IO64_CMD	_IOWR('N', 0x48, struct nvme_passthru_cmd64)
 #define NVME_IOCTL_IO64_CMD_VEC	_IOWR('N', 0x49, struct nvme_passthru_cmd64)
+/* Local experimental ABI; requires validated CDL2FEMU host support. */
+#define NVME_IOCTL_IO64_CMD_PRIO _IOWR('N', 0x4a, struct nvme_passthru_cmd64_prio)
+#define NVME_IOCTL_IO64_CMD_PRIO_VEC _IOWR('N', 0x4b, struct nvme_passthru_cmd64_prio)
 
 /* io_uring async commands: */
 #define NVME_URING_CMD_IO	_IOWR('N', 0x80, struct nvme_uring_cmd)
