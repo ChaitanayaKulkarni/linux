@@ -650,6 +650,7 @@ const struct block_device_operations nvme_ns_head_ops = {
 };
 
 static const struct file_operations nvme_ns_head_chr_fops = {
+	.fop_flags	= FOP_URING_CMD_IOPRIO,
 	.owner		= THIS_MODULE,
 	.unlocked_ioctl	= nvme_ns_head_chr_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,

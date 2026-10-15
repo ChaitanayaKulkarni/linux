@@ -505,6 +505,13 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	blk_mq_req_flags_t blk_flags = 0;
 	int ret;
 
+	if (ns && ioucmd->ioprio) {
+		ret = ioprio_check_cap(ioucmd->ioprio);
+		if (ret)
+			return ret;
+		if (!ctrl->cdl_ready)
+			return -EOPNOTSUPP;
+	}
 	c.common.opcode = READ_ONCE(cmd->opcode);
 	c.common.flags = READ_ONCE(cmd->flags);
 	if (c.common.flags)
@@ -559,7 +566,7 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 		rq_flags |= REQ_POLLED;
 
 	req = nvme_alloc_user_request(q, &c, rq_flags, blk_flags,
-				      0);
+				      ns ? ioucmd->ioprio : 0);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 	req->timeout = d.timeout_ms ? msecs_to_jiffies(d.timeout_ms) : 0;

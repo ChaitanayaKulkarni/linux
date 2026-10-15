@@ -3866,6 +3866,7 @@ static int nvme_dev_release(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations nvme_dev_fops = {
+	.fop_flags	= FOP_URING_CMD_IOPRIO,
 	.owner		= THIS_MODULE,
 	.open		= nvme_dev_open,
 	.release	= nvme_dev_release,
@@ -3978,6 +3979,7 @@ static int nvme_ns_chr_release(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations nvme_ns_chr_fops = {
+	.fop_flags	= FOP_URING_CMD_IOPRIO,
 	.owner		= THIS_MODULE,
 	.open		= nvme_ns_chr_open,
 	.release	= nvme_ns_chr_release,
