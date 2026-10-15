@@ -11,6 +11,7 @@ Block
    biovecs
    blk-mq
    cmdline-partition
+   cdl-femu
    data-integrity
    deadline-iosched
    inline-encryption
