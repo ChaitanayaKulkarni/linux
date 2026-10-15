@@ -3691,6 +3691,7 @@ static int nvme_init_identify(struct nvme_ctrl *ctrl)
 	ctrl->kas = le16_to_cpu(id->kas);
 	ctrl->max_namespaces = le32_to_cpu(id->mnan);
 	ctrl->ctratt = le32_to_cpu(id->ctratt);
+	ctrl->cdl_error = nvme_cdl_identify(ctrl, id);
 
 	ctrl->cntrltype = id->cntrltype;
 	ctrl->dctype = id->dctype;
@@ -3802,6 +3803,12 @@ int nvme_init_ctrl_finish(struct nvme_ctrl *ctrl, bool was_suspended)
 		return ret;
 
 	nvme_configure_opal(ctrl, was_suspended);
+	if (ctrl->cdl_profile) {
+		ctrl->cdl_error = nvme_cdl_discover(ctrl);
+		if (ctrl->cdl_error)
+			dev_warn(ctrl->device, "CDL profile unavailable: %d\n",
+				 ctrl->cdl_error);
+	}
 
 	if (!ctrl->identified && !nvme_discovery_ctrl(ctrl)) {
 		/*

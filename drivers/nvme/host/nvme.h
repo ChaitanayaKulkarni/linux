@@ -19,6 +19,7 @@
 #include <linux/ratelimit_types.h>
 
 #include <trace/events/block.h>
+#include "cdl.h"
 
 extern const struct pr_ops nvme_pr_ops;
 
@@ -409,6 +410,10 @@ struct nvme_ctrl {
 	u32 oaes;
 	u32 aen_result;
 	u32 ctratt;
+	struct nvme_cdl_caps cdl_caps;
+	bool cdl_profile;
+	bool cdl_supported;
+	int cdl_error;
 	unsigned int shutdown_timeout;
 	unsigned int kato;
 	bool subsystem;
