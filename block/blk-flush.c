@@ -95,9 +95,9 @@ static void blk_kick_flush(struct request_queue *q,
 			   struct blk_flush_queue *fq, blk_opf_t flags);
 
 static inline struct blk_flush_queue *
-blk_get_flush_queue(struct blk_mq_ctx *ctx)
+blk_get_flush_queue(struct request *rq)
 {
-	return blk_mq_map_queue(REQ_OP_FLUSH, ctx)->fq;
+	return rq->mq_hctx->fq;
 }
 
 static unsigned int blk_flush_cur_seq(struct request *rq)
@@ -206,7 +206,7 @@ static enum rq_end_io_ret flush_end_io(struct request *flush_rq,
 	struct list_head *running;
 	struct request *rq, *n;
 	unsigned long flags = 0;
-	struct blk_flush_queue *fq = blk_get_flush_queue(flush_rq->mq_ctx);
+	struct blk_flush_queue *fq = blk_get_flush_queue(flush_rq);
 
 	/* release the tag's ownership to the req cloned from */
 	spin_lock_irqsave(&fq->mq_flush_lock, flags);
@@ -341,9 +341,8 @@ static enum rq_end_io_ret mq_flush_data_end_io(struct request *rq,
 {
 	struct request_queue *q = rq->q;
 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
-	struct blk_mq_ctx *ctx = rq->mq_ctx;
 	unsigned long flags;
-	struct blk_flush_queue *fq = blk_get_flush_queue(ctx);
+	struct blk_flush_queue *fq = blk_get_flush_queue(rq);
 
 	if (q->elevator) {
 		WARN_ON(rq->tag < 0);
@@ -384,7 +383,7 @@ static void blk_rq_init_flush(struct request *rq)
 bool blk_insert_flush(struct request *rq)
 {
 	struct request_queue *q = rq->q;
-	struct blk_flush_queue *fq = blk_get_flush_queue(rq->mq_ctx);
+	struct blk_flush_queue *fq = blk_get_flush_queue(rq);
 	bool supports_fua = q->limits.features & BLK_FEAT_FUA;
 	unsigned int policy = 0;
 
