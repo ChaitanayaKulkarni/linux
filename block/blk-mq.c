@@ -71,7 +71,7 @@ static bool blk_mq_hctx_has_pending(struct blk_mq_hw_ctx *hctx)
 static void blk_mq_hctx_mark_pending(struct blk_mq_hw_ctx *hctx,
 				     struct blk_mq_ctx *ctx)
 {
-	const int bit = ctx->index_hw[hctx->type];
+	const int bit = *blk_mq_ctx_index(ctx, hctx->map_index);
 
 	if (!sbitmap_test_bit(&hctx->ctx_map, bit))
 		sbitmap_set_bit(&hctx->ctx_map, bit);
@@ -80,7 +80,7 @@ static void blk_mq_hctx_mark_pending(struct blk_mq_hw_ctx *hctx,
 static void blk_mq_hctx_clear_pending(struct blk_mq_hw_ctx *hctx,
 				      struct blk_mq_ctx *ctx)
 {
-	const int bit = ctx->index_hw[hctx->type];
+	const int bit = *blk_mq_ctx_index(ctx, hctx->map_index);
 
 	sbitmap_clear_bit(&hctx->ctx_map, bit);
 }
@@ -1770,10 +1770,10 @@ static bool flush_busy_ctx(struct sbitmap *sb, unsigned int bitnr, void *data)
 	struct flush_busy_ctx_data *flush_data = data;
 	struct blk_mq_hw_ctx *hctx = flush_data->hctx;
 	struct blk_mq_ctx *ctx = hctx->ctxs[bitnr];
-	enum hctx_type type = hctx->type;
+	unsigned int type = hctx->map_index;
 
 	spin_lock(&ctx->lock);
-	list_splice_tail_init(&ctx->rq_lists[type], flush_data->list);
+	list_splice_tail_init(blk_mq_ctx_rq_list(ctx, type), flush_data->list);
 	sbitmap_clear_bit(sb, bitnr);
 	spin_unlock(&ctx->lock);
 	return true;
@@ -1804,13 +1804,13 @@ static bool dispatch_rq_from_ctx(struct sbitmap *sb, unsigned int bitnr,
 	struct dispatch_rq_data *dispatch_data = data;
 	struct blk_mq_hw_ctx *hctx = dispatch_data->hctx;
 	struct blk_mq_ctx *ctx = hctx->ctxs[bitnr];
-	enum hctx_type type = hctx->type;
+	unsigned int type = hctx->map_index;
 
 	spin_lock(&ctx->lock);
-	if (!list_empty(&ctx->rq_lists[type])) {
-		dispatch_data->rq = list_entry_rq(ctx->rq_lists[type].next);
+	if (!list_empty(blk_mq_ctx_rq_list(ctx, type))) {
+		dispatch_data->rq = list_entry_rq(blk_mq_ctx_rq_list(ctx, type)->next);
 		list_del_init(&dispatch_data->rq->queuelist);
-		if (list_empty(&ctx->rq_lists[type]))
+		if (list_empty(blk_mq_ctx_rq_list(ctx, type)))
 			sbitmap_clear_bit(sb, bitnr);
 	}
 	spin_unlock(&ctx->lock);
@@ -1821,7 +1821,7 @@ static bool dispatch_rq_from_ctx(struct sbitmap *sb, unsigned int bitnr,
 struct request *blk_mq_dequeue_from_ctx(struct blk_mq_hw_ctx *hctx,
 					struct blk_mq_ctx *start)
 {
-	unsigned off = start ? start->index_hw[hctx->type] : 0;
+	unsigned int off = start ? *blk_mq_ctx_index(start, hctx->map_index) : 0;
 	struct dispatch_rq_data data = {
 		.hctx = hctx,
 		.rq   = NULL,
@@ -2557,7 +2557,7 @@ static void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx,
 		bool run_queue_async)
 {
 	struct request *rq;
-	enum hctx_type type = hctx->type;
+	unsigned int type = hctx->map_index;
 
 	/*
 	 * Try to issue requests directly if the hw queue isn't busy to save an
@@ -2582,7 +2582,7 @@ static void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx,
 	}
 
 	spin_lock(&ctx->lock);
-	list_splice_tail_init(list, &ctx->rq_lists[type]);
+	list_splice_tail_init(list, blk_mq_ctx_rq_list(ctx, type));
 	blk_mq_hctx_mark_pending(hctx, ctx);
 	spin_unlock(&ctx->lock);
 out:
@@ -2642,10 +2642,10 @@ static void blk_mq_insert_request(struct request *rq, blk_insert_t flags)
 
 		spin_lock(&ctx->lock);
 		if (flags & BLK_MQ_INSERT_AT_HEAD)
-			list_add(&rq->queuelist, &ctx->rq_lists[hctx->type]);
+			list_add(&rq->queuelist, blk_mq_ctx_rq_list(ctx, hctx->map_index));
 		else
 			list_add_tail(&rq->queuelist,
-				      &ctx->rq_lists[hctx->type]);
+				      blk_mq_ctx_rq_list(ctx, hctx->map_index));
 		blk_mq_hctx_mark_pending(hctx, ctx);
 		spin_unlock(&ctx->lock);
 	}
@@ -3506,14 +3506,14 @@ void blk_mq_free_rq_map(struct blk_mq_tag_set *set, struct blk_mq_tags *tags)
 	blk_mq_free_tags(set, tags);
 }
 
-static enum hctx_type hctx_idx_to_type(struct blk_mq_tag_set *set,
+static unsigned int hctx_idx_to_map(struct blk_mq_tag_set *set,
 		unsigned int hctx_idx)
 {
 	int i;
 
 	for (i = 0; i < set->nr_maps; i++) {
-		unsigned int start = set->map[i].queue_offset;
-		unsigned int end = start + set->map[i].nr_queues;
+		unsigned int start = blk_mq_queue_map(set, i)->queue_offset;
+		unsigned int end = start + blk_mq_queue_map(set, i)->nr_queues;
 
 		if (hctx_idx >= start && hctx_idx < end)
 			break;
@@ -3528,9 +3528,9 @@ static enum hctx_type hctx_idx_to_type(struct blk_mq_tag_set *set,
 static int blk_mq_get_hctx_node(struct blk_mq_tag_set *set,
 		unsigned int hctx_idx)
 {
-	enum hctx_type type = hctx_idx_to_type(set, hctx_idx);
+	unsigned int type = hctx_idx_to_map(set, hctx_idx);
 
-	return blk_mq_hw_queue_to_node(&set->map[type], hctx_idx);
+	return blk_mq_hw_queue_to_node(blk_mq_queue_map(set, type), hctx_idx);
 }
 
 static struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
@@ -3693,7 +3693,7 @@ static bool blk_mq_hctx_has_requests(struct blk_mq_hw_ctx *hctx)
 static bool blk_mq_hctx_has_online_cpu(struct blk_mq_hw_ctx *hctx,
 		unsigned int this_cpu)
 {
-	enum hctx_type type = hctx->type;
+	unsigned int type = hctx->map_index;
 	int cpu;
 
 	/*
@@ -3772,7 +3772,7 @@ static bool blk_mq_cpu_mapped_to_hctx(unsigned int cpu,
 		const struct blk_mq_hw_ctx *hctx)
 {
 	struct blk_mq_hw_ctx *mapped_hctx = blk_mq_map_queue_type(hctx->queue,
-			hctx->type, cpu);
+			hctx->map_index, cpu);
 
 	return mapped_hctx == hctx;
 }
@@ -3797,18 +3797,18 @@ static int blk_mq_hctx_notify_dead(unsigned int cpu, struct hlist_node *node)
 	struct blk_mq_hw_ctx *hctx;
 	struct blk_mq_ctx *ctx;
 	LIST_HEAD(tmp);
-	enum hctx_type type;
+	unsigned int type;
 
 	hctx = hlist_entry_safe(node, struct blk_mq_hw_ctx, cpuhp_dead);
 	if (!blk_mq_cpu_mapped_to_hctx(cpu, hctx))
 		return 0;
 
 	ctx = __blk_mq_get_ctx(hctx->queue, cpu);
-	type = hctx->type;
+	type = hctx->map_index;
 
 	spin_lock(&ctx->lock);
-	if (!list_empty(&ctx->rq_lists[type])) {
-		list_splice_init(&ctx->rq_lists[type], &tmp);
+	if (!list_empty(blk_mq_ctx_rq_list(ctx, type))) {
+		list_splice_init(blk_mq_ctx_rq_list(ctx, type), &tmp);
 		blk_mq_hctx_clear_pending(hctx, ctx);
 	}
 	spin_unlock(&ctx->lock);
@@ -4088,8 +4088,9 @@ static void blk_mq_init_cpu_queues(struct request_queue *q,
 
 		__ctx->cpu = i;
 		spin_lock_init(&__ctx->lock);
-		for (k = HCTX_TYPE_DEFAULT; k < HCTX_MAX_TYPES; k++)
-			INIT_LIST_HEAD(&__ctx->rq_lists[k]);
+		for (k = HCTX_TYPE_DEFAULT;
+		     k < max_t(unsigned int, set->nr_maps, HCTX_MAX_TYPES); k++)
+			INIT_LIST_HEAD(blk_mq_ctx_rq_list(__ctx, k));
 
 		__ctx->queue = q;
 
@@ -4159,7 +4160,7 @@ static void __blk_mq_free_map_and_rqs(struct blk_mq_tag_set *set,
 	set->tags[hctx_idx] = NULL;
 }
 
-static void blk_mq_map_swqueue(struct request_queue *q)
+static int blk_mq_map_swqueue(struct request_queue *q)
 {
 	unsigned int j, hctx_idx;
 	unsigned long i;
@@ -4182,26 +4183,28 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 
 		ctx = per_cpu_ptr(q->queue_ctx, i);
 		for (j = 0; j < set->nr_maps; j++) {
-			if (!set->map[j].nr_queues) {
-				ctx->hctxs[j] = blk_mq_map_queue_type(q,
+			if (!blk_mq_queue_map(set, j)->nr_queues) {
+				*blk_mq_ctx_hctx(ctx, j) = blk_mq_map_queue_type(q,
 						HCTX_TYPE_DEFAULT, i);
 				continue;
 			}
-			hctx_idx = set->map[j].mq_map[i];
+			hctx_idx = blk_mq_queue_map(set, j)->mq_map[i];
 			/* unmapped hw queue can be remapped after CPU topo changed */
 			if (!set->tags[hctx_idx] &&
 			    !__blk_mq_alloc_map_and_rqs(set, hctx_idx)) {
+				if (j >= HCTX_MAX_TYPES)
+					return -ENOMEM;
 				/*
 				 * If tags initialization fail for some hctx,
 				 * that hctx won't be brought online.  In this
 				 * case, remap the current ctx to hctx[0] which
 				 * is guaranteed to always have tags allocated
 				 */
-				set->map[j].mq_map[i] = 0;
+				blk_mq_queue_map(set, j)->mq_map[i] = 0;
 			}
 
 			hctx = blk_mq_map_queue_type(q, j, i);
-			ctx->hctxs[j] = hctx;
+			*blk_mq_ctx_hctx(ctx, j) = hctx;
 			/*
 			 * If the CPU is already set in the mask, then we've
 			 * mapped this one already. This can happen if
@@ -4211,8 +4214,9 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 				continue;
 
 			cpumask_set_cpu(i, hctx->cpumask);
-			hctx->type = j;
-			ctx->index_hw[hctx->type] = hctx->nr_ctx;
+			hctx->map_index = j;
+			hctx->type = j < HCTX_MAX_TYPES ? j : HCTX_TYPE_DEFAULT;
+			*blk_mq_ctx_index(ctx, hctx->map_index) = hctx->nr_ctx;
 			hctx->ctxs[hctx->nr_ctx++] = ctx;
 
 			/*
@@ -4223,7 +4227,7 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 		}
 
 		for (; j < HCTX_MAX_TYPES; j++)
-			ctx->hctxs[j] = blk_mq_map_queue_type(q,
+			*blk_mq_ctx_hctx(ctx, j) = blk_mq_map_queue_type(q,
 					HCTX_TYPE_DEFAULT, i);
 	}
 
@@ -4235,6 +4239,8 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 		 * disable it and free the request entries.
 		 */
 		if (!hctx->nr_ctx) {
+			if (hctx_idx_to_map(set, i) >= HCTX_MAX_TYPES)
+				return -EINVAL;
 			/* Never unmap queue 0.  We need it as a
 			 * fallback in case of a new remap fails
 			 * allocation
@@ -4275,6 +4281,7 @@ static void blk_mq_map_swqueue(struct request_queue *q)
 		hctx->next_cpu = blk_mq_first_mapped_cpu(hctx);
 		hctx->next_cpu_batch = BLK_MQ_CPU_WORK_BATCH;
 	}
+	return 0;
 }
 
 /*
@@ -4364,12 +4371,22 @@ static int blk_mq_alloc_ctxs(struct request_queue *q)
 	for_each_possible_cpu(cpu) {
 		struct blk_mq_ctx *ctx = per_cpu_ptr(ctxs->queue_ctx, cpu);
 		ctx->ctxs = ctxs;
+		if (q->tag_set->nr_maps > HCTX_MAX_TYPES) {
+			ctx->extra_maps = kcalloc(q->tag_set->nr_maps - HCTX_MAX_TYPES,
+						 sizeof(*ctx->extra_maps), GFP_KERNEL);
+			if (!ctx->extra_maps)
+				goto fail_maps;
+		}
 	}
 
 	q->mq_kobj = &ctxs->kobj;
 	q->queue_ctx = ctxs->queue_ctx;
 
 	return 0;
+fail_maps:
+	for_each_possible_cpu(cpu)
+		kfree(per_cpu_ptr(ctxs->queue_ctx, cpu)->extra_maps);
+	free_percpu(ctxs->queue_ctx);
  fail:
 	kfree(ctxs);
 	return -ENOMEM;
@@ -4657,7 +4674,8 @@ int blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
 	q->async_depth = set->queue_depth;
 
 	blk_mq_init_cpu_queues(q, set->nr_hw_queues);
-	blk_mq_map_swqueue(q);
+	if (blk_mq_map_swqueue(q))
+		goto err_hctxs;
 	blk_mq_add_queue_tag_set(set, q);
 	return 0;
 
@@ -4751,11 +4769,10 @@ static void blk_mq_update_queue_map(struct blk_mq_tag_set *set)
 {
 	/*
 	 * blk_mq_map_queues() and multiple .map_queues() implementations
-	 * expect that set->map[HCTX_TYPE_DEFAULT].nr_queues is set to the
-	 * number of hardware queues.
+	 * expect the default map's nr_queues to contain the hardware queue count.
 	 */
 	if (set->nr_maps == 1)
-		set->map[HCTX_TYPE_DEFAULT].nr_queues = set->nr_hw_queues;
+		blk_mq_queue_map(set, HCTX_TYPE_DEFAULT)->nr_queues = set->nr_hw_queues;
 
 	if (set->ops->map_queues) {
 		int i;
@@ -4767,7 +4784,7 @@ static void blk_mq_update_queue_map(struct blk_mq_tag_set *set)
 		 * for (queue = 0; queue < set->nr_hw_queues; queue++) {
 		 * 	mask = get_cpu_mask(queue)
 		 * 	for_each_cpu(cpu, mask)
-		 * 		set->map[x].mq_map[cpu] = queue;
+		 *         blk_mq_queue_map(set, x)->mq_map[cpu] = queue;
 		 * }
 		 *
 		 * When we need to remap, the table has to be cleared for
@@ -4775,12 +4792,12 @@ static void blk_mq_update_queue_map(struct blk_mq_tag_set *set)
 		 * to any hw queue.
 		 */
 		for (i = 0; i < set->nr_maps; i++)
-			blk_mq_clear_mq_map(&set->map[i]);
+			blk_mq_clear_mq_map(blk_mq_queue_map(set, i));
 
 		set->ops->map_queues(set);
 	} else {
 		BUG_ON(set->nr_maps > 1);
-		blk_mq_map_queues(&set->map[HCTX_TYPE_DEFAULT]);
+		blk_mq_map_queues(blk_mq_queue_map(set, HCTX_TYPE_DEFAULT));
 	}
 }
 
@@ -4858,7 +4875,7 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 
 	if (!set->nr_maps)
 		set->nr_maps = 1;
-	else if (set->nr_maps > HCTX_MAX_TYPES)
+	if (set->nr_maps > U16_MAX)
 		return -EINVAL;
 
 	/*
@@ -4891,6 +4908,13 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 	init_rwsem(&set->update_nr_hwq_lock);
 
 	ret = -ENOMEM;
+	if (set->nr_maps > HCTX_MAX_TYPES) {
+		set->extra_maps = kcalloc_node(set->nr_maps - HCTX_MAX_TYPES,
+					     sizeof(*set->extra_maps), GFP_KERNEL,
+					     set->numa_node);
+		if (!set->extra_maps)
+			goto out_cleanup_tags_srcu;
+	}
 	set->tags = kcalloc_node(set->nr_hw_queues,
 				 sizeof(struct blk_mq_tags *), GFP_KERNEL,
 				 set->numa_node);
@@ -4898,12 +4922,12 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 		goto out_cleanup_tags_srcu;
 
 	for (i = 0; i < set->nr_maps; i++) {
-		set->map[i].mq_map = kcalloc_node(nr_cpu_ids,
-						  sizeof(set->map[i].mq_map[0]),
+		blk_mq_queue_map(set, i)->mq_map = kcalloc_node(nr_cpu_ids,
+						  sizeof(blk_mq_queue_map(set, i)->mq_map[0]),
 						  GFP_KERNEL, set->numa_node);
-		if (!set->map[i].mq_map)
+		if (!blk_mq_queue_map(set, i)->mq_map)
 			goto out_free_mq_map;
-		set->map[i].nr_queues = set->nr_hw_queues;
+		blk_mq_queue_map(set, i)->nr_queues = set->nr_hw_queues;
 	}
 
 	blk_mq_update_queue_map(set);
@@ -4919,12 +4943,14 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 
 out_free_mq_map:
 	for (i = 0; i < set->nr_maps; i++) {
-		kfree(set->map[i].mq_map);
-		set->map[i].mq_map = NULL;
+		kfree(blk_mq_queue_map(set, i)->mq_map);
+		blk_mq_queue_map(set, i)->mq_map = NULL;
 	}
 	kfree(set->tags);
 	set->tags = NULL;
 out_cleanup_tags_srcu:
+	kfree(set->extra_maps);
+	set->extra_maps = NULL;
 	cleanup_srcu_struct(&set->tags_srcu);
 out_cleanup_srcu:
 	if (set->flags & BLK_MQ_F_BLOCKING)
@@ -4965,13 +4991,15 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set)
 	}
 
 	for (j = 0; j < set->nr_maps; j++) {
-		kfree(set->map[j].mq_map);
-		set->map[j].mq_map = NULL;
+		kfree(blk_mq_queue_map(set, j)->mq_map);
+		blk_mq_queue_map(set, j)->mq_map = NULL;
 	}
 
 	kfree(set->tags);
 	set->tags = NULL;
 
+	kfree(set->extra_maps);
+	set->extra_maps = NULL;
 	srcu_barrier(&set->tags_srcu);
 	cleanup_srcu_struct(&set->tags_srcu);
 	if (set->flags & BLK_MQ_F_BLOCKING) {

@@ -13,6 +13,12 @@ struct blk_mq_ctxs {
 	struct blk_mq_ctx __percpu	*queue_ctx;
 };
 
+struct blk_mq_ctx_map {
+	struct list_head rq_list;
+	struct blk_mq_hw_ctx *hctx;
+	unsigned short index_hw;
+};
+
 /**
  * struct blk_mq_ctx - State for a software queue facing the submitting CPUs
  */
@@ -26,10 +32,37 @@ struct blk_mq_ctx {
 	unsigned short		index_hw[HCTX_MAX_TYPES];
 	struct blk_mq_hw_ctx 	*hctxs[HCTX_MAX_TYPES];
 
+	/* Additional immutable map slots; built-in arrays stay embedded. */
+	struct blk_mq_ctx_map	*extra_maps;
+
 	struct request_queue	*queue;
 	struct blk_mq_ctxs      *ctxs;
 	struct kobject		kobj;
 } ____cacheline_aligned_in_smp;
+
+static inline struct list_head *blk_mq_ctx_rq_list(struct blk_mq_ctx *ctx,
+		unsigned int map)
+{
+	if (map < HCTX_MAX_TYPES)
+		return &ctx->rq_lists[map];
+	return &ctx->extra_maps[map - HCTX_MAX_TYPES].rq_list;
+}
+
+static inline unsigned short *blk_mq_ctx_index(struct blk_mq_ctx *ctx,
+		unsigned int map)
+{
+	if (map < HCTX_MAX_TYPES)
+		return &ctx->index_hw[map];
+	return &ctx->extra_maps[map - HCTX_MAX_TYPES].index_hw;
+}
+
+static inline struct blk_mq_hw_ctx **blk_mq_ctx_hctx(struct blk_mq_ctx *ctx,
+		unsigned int map)
+{
+	if (map < HCTX_MAX_TYPES)
+		return &ctx->hctxs[map];
+	return &ctx->extra_maps[map - HCTX_MAX_TYPES].hctx;
+}
 
 enum {
 	BLK_MQ_NO_TAG		= -1U,
@@ -81,10 +114,10 @@ extern int blk_mq_hw_queue_to_node(struct blk_mq_queue_map *qmap, unsigned int);
  * @cpu: CPU
  */
 static inline struct blk_mq_hw_ctx *blk_mq_map_queue_type(struct request_queue *q,
-							  enum hctx_type type,
+							  unsigned int type,
 							  unsigned int cpu)
 {
-	return queue_hctx((q), (q->tag_set->map[type].mq_map[cpu]));
+	return queue_hctx(q, blk_mq_queue_map(q->tag_set, type)->mq_map[cpu]);
 }
 
 static inline enum hctx_type blk_mq_get_hctx_type(blk_opf_t opf)

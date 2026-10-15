@@ -16,7 +16,10 @@
 static void blk_mq_sysfs_release(struct kobject *kobj)
 {
 	struct blk_mq_ctxs *ctxs = container_of(kobj, struct blk_mq_ctxs, kobj);
+	int cpu;
 
+	for_each_possible_cpu(cpu)
+		kfree(per_cpu_ptr(ctxs->queue_ctx, cpu)->extra_maps);
 	free_percpu(ctxs->queue_ctx);
 	kfree(ctxs);
 }
@@ -148,9 +151,11 @@ static void blk_mq_unregister_hctx(struct blk_mq_hw_ctx *hctx)
 	if (!hctx->nr_ctx)
 		return;
 
-	hctx_for_each_ctx(hctx, ctx, i)
-		if (ctx->kobj.state_in_sysfs)
-			kobject_del(&ctx->kobj);
+	/* Extra maps share the CPU context registered under its ordinary hctx. */
+	if (hctx->map_index < HCTX_MAX_TYPES)
+		hctx_for_each_ctx(hctx, ctx, i)
+			if (ctx->kobj.state_in_sysfs)
+				kobject_del(&ctx->kobj);
 
 	if (hctx->kobj.state_in_sysfs)
 		kobject_del(&hctx->kobj);
@@ -168,6 +173,10 @@ static int blk_mq_register_hctx(struct blk_mq_hw_ctx *hctx)
 	ret = kobject_add(&hctx->kobj, q->mq_kobj, "%u", hctx->queue_num);
 	if (ret)
 		return ret;
+
+	/* Do not register one CPU kobject twice; cpu_list describes extra maps. */
+	if (hctx->map_index >= HCTX_MAX_TYPES)
+		return 0;
 
 	hctx_for_each_ctx(hctx, ctx, i) {
 		ret = kobject_add(&ctx->kobj, &hctx->kobj, "cpu%u", ctx->cpu);

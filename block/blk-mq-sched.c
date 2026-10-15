@@ -194,7 +194,7 @@ static int blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
 static struct blk_mq_ctx *blk_mq_next_ctx(struct blk_mq_hw_ctx *hctx,
 					  struct blk_mq_ctx *ctx)
 {
-	unsigned short idx = ctx->index_hw[hctx->type];
+	unsigned short idx = *blk_mq_ctx_index(ctx, hctx->map_index);
 
 	if (++idx == hctx->nr_ctx)
 		idx = 0;
@@ -339,7 +339,7 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
 	struct blk_mq_ctx *ctx;
 	struct blk_mq_hw_ctx *hctx;
 	bool ret = false;
-	enum hctx_type type;
+	unsigned int type;
 
 	if (e && e->type->ops.bio_merge) {
 		ret = e->type->ops.bio_merge(q, bio, nr_segs);
@@ -348,8 +348,8 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
 
 	ctx = blk_mq_get_ctx(q);
 	hctx = blk_mq_map_queue(bio->bi_opf, ctx);
-	type = hctx->type;
-	if (list_empty_careful(&ctx->rq_lists[type]))
+	type = hctx->map_index;
+	if (list_empty_careful(blk_mq_ctx_rq_list(ctx, type)))
 		goto out_put;
 
 	/* default per sw-queue merge */
@@ -359,7 +359,7 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
 	 * potentially merge with. Currently includes a hand-wavy stop
 	 * count of 8, to not spend too much time checking for merges.
 	 */
-	if (blk_bio_list_merge(q, &ctx->rq_lists[type], bio, nr_segs))
+	if (blk_bio_list_merge(q, blk_mq_ctx_rq_list(ctx, type), bio, nr_segs))
 		ret = true;
 
 	spin_unlock(&ctx->lock);

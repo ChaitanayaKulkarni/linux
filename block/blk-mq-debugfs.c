@@ -383,7 +383,10 @@ static int hctx_type_show(void *data, struct seq_file *m)
 	struct blk_mq_hw_ctx *hctx = data;
 
 	BUILD_BUG_ON(ARRAY_SIZE(hctx_types) != HCTX_MAX_TYPES);
-	seq_printf(m, "%s\n", hctx_types[hctx->type]);
+	if (hctx->map_index < HCTX_MAX_TYPES)
+		seq_printf(m, "%s\n", hctx_types[hctx->type]);
+	else
+		seq_printf(m, "class-map-%u\n", hctx->map_index - HCTX_MAX_TYPES);
 	return 0;
 }
 

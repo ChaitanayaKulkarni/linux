@@ -396,6 +396,8 @@ struct blk_mq_hw_ctx {
 
 	/** @type: HCTX_TYPE_* flags. Type of hardware queue. */
 	unsigned short		type;
+	/** @map_index: CPU map slot, independent of operation category. */
+	unsigned short		map_index;
 	/** @nr_ctx: Number of software queues. */
 	unsigned short		nr_ctx;
 	/** @ctxs: Array of software queues. */
@@ -534,6 +536,8 @@ enum hctx_type {
 struct blk_mq_tag_set {
 	const struct blk_mq_ops	*ops;
 	struct blk_mq_queue_map	map[HCTX_MAX_TYPES];
+	/* Built-in maps remain embedded for existing drivers. */
+	struct blk_mq_queue_map	*extra_maps;
 	unsigned int		nr_maps;
 	unsigned int		nr_hw_queues;
 	unsigned int		queue_depth;
@@ -555,6 +559,14 @@ struct blk_mq_tag_set {
 
 	struct rw_semaphore	update_nr_hwq_lock;
 };
+
+static inline struct blk_mq_queue_map *
+blk_mq_queue_map(struct blk_mq_tag_set *set, unsigned int index)
+{
+	if (index < HCTX_MAX_TYPES)
+		return &set->map[index];
+	return &set->extra_maps[index - HCTX_MAX_TYPES];
+}
 
 /**
  * struct blk_mq_queue_data - Data about a request inserted in a queue
