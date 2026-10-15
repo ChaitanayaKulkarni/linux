@@ -27,6 +27,7 @@
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/sed-opal.h>
+#include <linux/sort.h>
 
 #include "trace.h"
 #include "nvme.h"
@@ -277,6 +278,50 @@ static bool noacpi;
 module_param(noacpi, bool, 0444);
 MODULE_PARM_DESC(noacpi, "disable acpi bios quirks");
 
+/* Experimental initial-probe profile; no runtime reconfiguration. */
+static char *cdl_target;
+module_param(cdl_target, charp, 0444);
+MODULE_PARM_DESC(cdl_target, "PCI BDF of the FEMU controller to configure");
+
+static ushort cdl_classes[255] = { 1, 2, 3, 4 };
+static unsigned int cdl_class_count = 4;
+module_param_array(cdl_classes, ushort, &cdl_class_count, 0444);
+MODULE_PARM_DESC(cdl_classes, "Selected nonzero CDL class IDs");
+
+static uint cdl_durations_us[255] = { 300, 1000, 2000, 5000 };
+static unsigned int cdl_duration_count = 4;
+module_param_array(cdl_durations_us, uint, &cdl_duration_count, 0444);
+MODULE_PARM_DESC(cdl_durations_us, "Duration in microseconds for each selected class");
+
+static ushort cdl_queues_per_class = 4;
+module_param(cdl_queues_per_class, ushort, 0444);
+MODULE_PARM_DESC(cdl_queues_per_class, "Dedicated CPU queues in each selected class");
+
+static ushort cdl_ordinary_queues = 4;
+module_param(cdl_ordinary_queues, ushort, 0444);
+MODULE_PARM_DESC(cdl_ordinary_queues, "Ordinary CPU queues on the selected controller");
+
+static ushort cdl_queue_depth = 64;
+module_param(cdl_queue_depth, ushort, 0444);
+MODULE_PARM_DESC(cdl_queue_depth, "Ring entries for ordinary and CDL I/O queues");
+
+struct nvme_cdl_class_setup {
+	u32 duration_us;
+	u16 id;
+};
+
+struct nvme_cdl_profile {
+	u16 nr_classes;
+	u16 queues_per_class;
+	u16 ordinary_queues;
+	u16 depth;
+	u32 nr_queues;
+	u32 granted_sqs;
+	u32 granted_cqs;
+	u16 class_to_map[NVME_CDL_MAX_CLASSES];
+	struct nvme_cdl_class_setup classes[];
+};
+
 struct nvme_dev;
 struct nvme_queue;
 
@@ -293,6 +338,7 @@ struct nvme_descriptor_pools {
  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
  */
 struct nvme_dev {
+	struct nvme_cdl_profile *cdl;
 	struct nvme_queue *queues;
 	struct blk_mq_tag_set tagset;
 	struct blk_mq_tag_set admin_tagset;
@@ -2945,6 +2991,64 @@ static int nvme_setup_irqs(struct nvme_dev *dev, unsigned int nr_io_queues)
 					      &affd);
 }
 
+static int nvme_cdl_class_cmp(const void *a, const void *b)
+{
+	const struct nvme_cdl_class_setup *left = a, *right = b;
+
+	if (left->duration_us != right->duration_us)
+		return left->duration_us < right->duration_us ? -1 : 1;
+	return (int)left->id - right->id;
+}
+
+static int nvme_cdl_profile_init(struct nvme_dev *dev, struct pci_dev *pdev)
+{
+	struct nvme_cdl_profile *profile;
+	unsigned int i, j, total;
+
+	if (!cdl_target || strcmp(cdl_target, pci_name(pdev)))
+		return 0;
+	if (pdev->vendor != 0x8086 || pdev->device != 0x5845)
+		return -EOPNOTSUPP;
+	if (!cdl_class_count || cdl_class_count != cdl_duration_count ||
+	    !cdl_queues_per_class || !cdl_ordinary_queues || cdl_queue_depth < 2 ||
+	    cdl_queue_depth - 1 > BLK_MQ_MAX_DEPTH || poll_queues || write_queues)
+		return -EINVAL;
+	/* The first fixture requires a dedicated queue for each possible CPU. */
+	if (cdl_queues_per_class != num_possible_cpus() ||
+	    cdl_ordinary_queues != num_possible_cpus() ||
+	    !cpumask_equal(cpu_possible_mask, cpu_online_mask))
+		return -EINVAL;
+	total = cdl_class_count * cdl_queues_per_class + cdl_ordinary_queues;
+	if (total > U16_MAX)
+		return -EOVERFLOW;
+	for (i = 0; i < cdl_class_count; i++) {
+		if (!cdl_classes[i] || cdl_classes[i] >= NVME_CDL_MAX_CLASSES ||
+		    !cdl_durations_us[i])
+			return -EINVAL;
+		for (j = 0; j < i; j++)
+			if (cdl_classes[i] == cdl_classes[j])
+				return -EINVAL;
+	}
+	profile = kzalloc(struct_size(profile, classes, cdl_class_count), GFP_KERNEL);
+	if (!profile)
+		return -ENOMEM;
+	profile->nr_classes = cdl_class_count;
+	profile->queues_per_class = cdl_queues_per_class;
+	profile->ordinary_queues = cdl_ordinary_queues;
+	profile->nr_queues = total;
+	profile->depth = cdl_queue_depth;
+	for (i = 0; i < cdl_class_count; i++) {
+		profile->classes[i].id = cdl_classes[i];
+		profile->classes[i].duration_us = cdl_durations_us[i];
+	}
+	sort(profile->classes, profile->nr_classes, sizeof(profile->classes[0]),
+	     nvme_cdl_class_cmp, NULL);
+	for (i = 0; i < profile->nr_classes; i++)
+		profile->class_to_map[profile->classes[i].id] = HCTX_MAX_TYPES + i;
+	dev->cdl = profile;
+	return 0;
+}
+
 static unsigned int nvme_max_io_queues(struct nvme_dev *dev)
 {
 	/*
@@ -3395,6 +3499,7 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
 	nvme_free_tagset(dev);
 	put_device(dev->dev);
 	kfree(dev->queues);
+	kfree(dev->cdl);
 	kfree(dev);
 }
 
@@ -3704,11 +3809,17 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 
 	dev->nr_write_queues = write_queues;
 	dev->nr_poll_queues = poll_queues;
-	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
+	ret = nvme_cdl_profile_init(dev, pdev);
+	if (ret)
+		goto out_free_dev;
+	dev->nr_allocated_queues = dev->cdl ? dev->cdl->nr_queues + 1 :
+		nvme_max_io_queues(dev) + 1;
 	dev->queues = kcalloc_node(dev->nr_allocated_queues,
 			sizeof(struct nvme_queue), GFP_KERNEL, node);
-	if (!dev->queues)
+	if (!dev->queues) {
+		ret = -ENOMEM;
 		goto out_free_dev;
+	}
 
 	dev->dev = get_device(&pdev->dev);
 
@@ -3756,6 +3867,7 @@ out_put_device:
 	put_device(dev->dev);
 	kfree(dev->queues);
 out_free_dev:
+	kfree(dev->cdl);
 	kfree(dev);
 	return ERR_PTR(ret);
 }
