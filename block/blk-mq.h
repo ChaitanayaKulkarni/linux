@@ -3,6 +3,7 @@
 #define INT_BLK_MQ_H
 
 #include <linux/blk-mq.h>
+#include <linux/ioprio.h>
 #include "blk-stat.h"
 
 struct blk_mq_tag_set;
@@ -120,15 +121,21 @@ static inline struct blk_mq_hw_ctx *blk_mq_map_queue_type(struct request_queue *
 	return queue_hctx(q, blk_mq_queue_map(q->tag_set, type)->mq_map[cpu]);
 }
 
-static inline enum hctx_type blk_mq_get_hctx_type(blk_opf_t opf)
+static inline unsigned int blk_mq_get_map_index(struct blk_mq_tag_set *set,
+					       blk_opf_t opf, u16 ioprio)
 {
-	enum hctx_type type = HCTX_TYPE_DEFAULT;
+	unsigned int type = HCTX_TYPE_DEFAULT;
+	const u16 *classes = READ_ONCE(set->class_to_map);
+	unsigned int hint = IOPRIO_PRIO_HINT(ioprio);
 
 	/*
 	 * The caller ensure that if REQ_POLLED, poll must be enabled.
 	 */
 	if (opf & REQ_POLLED)
 		type = HCTX_TYPE_POLL;
+	else if (classes && IOPRIO_PRIO_CLASS(ioprio) != IOPRIO_CLASS_NONE &&
+		 hint && hint < set->nr_classes && classes[hint])
+		type = classes[hint];
 	else if ((opf & REQ_OP_MASK) == REQ_OP_READ)
 		type = HCTX_TYPE_READ;
 	return type;
@@ -140,9 +147,10 @@ static inline enum hctx_type blk_mq_get_hctx_type(blk_opf_t opf)
  * @ctx: software queue cpu ctx
  */
 static inline struct blk_mq_hw_ctx *blk_mq_map_queue(blk_opf_t opf,
-						     struct blk_mq_ctx *ctx)
+					struct blk_mq_ctx *ctx, u16 ioprio)
 {
-	return ctx->hctxs[blk_mq_get_hctx_type(opf)];
+	return *blk_mq_ctx_hctx(ctx,
+		blk_mq_get_map_index(ctx->queue->tag_set, opf, ioprio));
 }
 
 /*
@@ -197,6 +205,7 @@ struct blk_mq_alloc_data {
 	unsigned int shallow_depth;
 	blk_opf_t cmd_flags;
 	req_flags_t rq_flags;
+	u16 ioprio;
 
 	/* allocate multiple requests/tags in one go */
 	unsigned int nr_tags;

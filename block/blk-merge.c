@@ -786,6 +786,9 @@ static struct request *attempt_merge(struct request_queue *q,
 		return NULL;
 	if (req->bio->bi_ioprio != next->bio->bi_ioprio)
 		return NULL;
+	if (req->mq_hctx->map_index >= HCTX_MAX_TYPES &&
+	    req->mq_hctx != next->mq_hctx)
+		return NULL;
 	if (!blk_atomic_write_mergeable_rqs(req, next))
 		return NULL;
 
@@ -911,6 +914,12 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 	if (rq->bio->bi_write_stream != bio->bi_write_stream)
 		return false;
 	if (rq->bio->bi_ioprio != bio->bi_ioprio)
+		return false;
+	if (rq->q->tag_set->class_to_map &&
+	    blk_mq_get_map_index(rq->q->tag_set, bio->bi_opf,
+				 bio->bi_ioprio) >= HCTX_MAX_TYPES &&
+	    rq->mq_hctx != blk_mq_map_queue(bio->bi_opf,
+					 blk_mq_get_ctx(rq->q), bio->bi_ioprio))
 		return false;
 	if (unlikely(!blk_atomic_write_mergeable_rq_bio(rq, bio)))
 		return false;

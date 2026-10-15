@@ -550,7 +550,7 @@ static struct request *__blk_mq_alloc_requests(struct blk_mq_alloc_data *data)
 
 retry:
 	data->ctx = blk_mq_get_ctx(q);
-	data->hctx = blk_mq_map_queue(data->cmd_flags, data->ctx);
+	data->hctx = blk_mq_map_queue(data->cmd_flags, data->ctx, data->ioprio);
 
 	blk_mq_limit_depth(data);
 	if (data->flags & BLK_MQ_REQ_RESERVED)
@@ -597,13 +597,15 @@ retry:
 static struct request *blk_mq_rq_cache_fill(struct request_queue *q,
 					    struct blk_plug *plug,
 					    blk_opf_t opf,
-					    blk_mq_req_flags_t flags)
+					    blk_mq_req_flags_t flags,
+					    u16 ioprio)
 {
 	struct blk_mq_alloc_data data = {
 		.q		= q,
 		.flags		= flags,
 		.shallow_depth	= 0,
 		.cmd_flags	= opf,
+		.ioprio		= ioprio,
 		.rq_flags	= 0,
 		.nr_tags	= plug->nr_ios,
 		.cached_rqs	= &plug->cached_rqs,
@@ -614,6 +616,10 @@ static struct request *blk_mq_rq_cache_fill(struct request_queue *q,
 
 	if (blk_queue_enter(q, flags))
 		return NULL;
+	if ((opf & REQ_POLLED) && !blk_mq_can_poll(q)) {
+		blk_queue_exit(q);
+		return NULL;
+	}
 
 	plug->nr_ios = 1;
 
@@ -625,7 +631,8 @@ static struct request *blk_mq_rq_cache_fill(struct request_queue *q,
 
 static struct request *blk_mq_alloc_cached_request(struct request_queue *q,
 						   blk_opf_t opf,
-						   blk_mq_req_flags_t flags)
+						   blk_mq_req_flags_t flags,
+						   u16 ioprio)
 {
 	struct blk_plug *plug = current->plug;
 	struct request *rq;
@@ -636,7 +643,7 @@ static struct request *blk_mq_alloc_cached_request(struct request_queue *q,
 	if (rq_list_empty(&plug->cached_rqs)) {
 		if (plug->nr_ios == 1)
 			return NULL;
-		rq = blk_mq_rq_cache_fill(q, plug, opf, flags);
+		rq = blk_mq_rq_cache_fill(q, plug, opf, flags, ioprio);
 		if (!rq)
 			return NULL;
 	} else {
@@ -644,9 +651,12 @@ static struct request *blk_mq_alloc_cached_request(struct request_queue *q,
 		if (!rq || rq->q != q)
 			return NULL;
 
-		if (blk_mq_get_hctx_type(opf) != rq->mq_hctx->type)
+		if (blk_mq_get_map_index(q->tag_set, opf, ioprio) != rq->mq_hctx->map_index)
 			return NULL;
 		if (op_is_flush(rq->cmd_flags) != op_is_flush(opf))
+			return NULL;
+		if (rq->mq_hctx->map_index >= HCTX_MAX_TYPES &&
+		    rq->mq_hctx != blk_mq_map_queue(opf, blk_mq_get_ctx(q), ioprio))
 			return NULL;
 
 		rq_list_pop(&plug->cached_rqs);
@@ -658,18 +668,19 @@ static struct request *blk_mq_alloc_cached_request(struct request_queue *q,
 	return rq;
 }
 
-struct request *blk_mq_alloc_request(struct request_queue *q, blk_opf_t opf,
-		blk_mq_req_flags_t flags)
+static struct request *blk_mq_alloc_request_priority(struct request_queue *q,
+		blk_opf_t opf, blk_mq_req_flags_t flags, u16 ioprio)
 {
 	struct request *rq;
 
-	rq = blk_mq_alloc_cached_request(q, opf, flags);
+	rq = blk_mq_alloc_cached_request(q, opf, flags, ioprio);
 	if (!rq) {
 		struct blk_mq_alloc_data data = {
 			.q		= q,
 			.flags		= flags,
 			.shallow_depth	= 0,
 			.cmd_flags	= opf,
+			.ioprio		= ioprio,
 			.rq_flags	= 0,
 			.nr_tags	= 1,
 			.cached_rqs	= NULL,
@@ -682,6 +693,10 @@ struct request *blk_mq_alloc_request(struct request_queue *q, blk_opf_t opf,
 		if (ret)
 			return ERR_PTR(ret);
 
+		if ((opf & REQ_POLLED) && !blk_mq_can_poll(q)) {
+			blk_queue_exit(q);
+			return ERR_PTR(-EOPNOTSUPP);
+		}
 		rq = __blk_mq_alloc_requests(&data);
 		if (!rq)
 			goto out_queue_exit;
@@ -695,7 +710,20 @@ out_queue_exit:
 	blk_queue_exit(q);
 	return ERR_PTR(-EWOULDBLOCK);
 }
+
+struct request *blk_mq_alloc_request(struct request_queue *q, blk_opf_t opf,
+		blk_mq_req_flags_t flags)
+{
+	return blk_mq_alloc_request_priority(q, opf, flags, 0);
+}
 EXPORT_SYMBOL(blk_mq_alloc_request);
+
+struct request *blk_mq_alloc_request_ioprio(struct request_queue *q,
+		blk_opf_t opf, blk_mq_req_flags_t flags, u16 ioprio)
+{
+	return blk_mq_alloc_request_priority(q, opf, flags, ioprio);
+}
+EXPORT_SYMBOL_GPL(blk_mq_alloc_request_ioprio);
 
 struct request *blk_mq_alloc_request_hctx(struct request_queue *q,
 	blk_opf_t opf, blk_mq_req_flags_t flags, unsigned int hctx_idx)
@@ -3021,6 +3049,7 @@ static struct request *blk_mq_get_new_requests(struct request_queue *q,
 		.flags		= 0,
 		.shallow_depth	= 0,
 		.cmd_flags	= bio->bi_opf,
+		.ioprio		= bio->bi_ioprio,
 		.rq_flags	= 0,
 		.nr_tags	= 1,
 		.cached_rqs	= NULL,
@@ -3047,9 +3076,9 @@ static struct request *blk_mq_get_new_requests(struct request_queue *q,
  * Check if there is a suitable cached request and return it.
  */
 static struct request *blk_mq_get_cached_request(struct blk_plug *plug,
-		struct request_queue *q, blk_opf_t opf)
+		struct request_queue *q, blk_opf_t opf, u16 ioprio)
 {
-	enum hctx_type type = blk_mq_get_hctx_type(opf);
+	unsigned int type;
 	struct request *rq;
 
 	if (!plug)
@@ -3057,10 +3086,14 @@ static struct request *blk_mq_get_cached_request(struct blk_plug *plug,
 	rq = rq_list_peek(&plug->cached_rqs);
 	if (!rq || rq->q != q)
 		return NULL;
-	if (type != rq->mq_hctx->type &&
-	    (type != HCTX_TYPE_READ || rq->mq_hctx->type != HCTX_TYPE_DEFAULT))
+	type = blk_mq_get_map_index(q->tag_set, opf, ioprio);
+	if (type != rq->mq_hctx->map_index &&
+	    (type != HCTX_TYPE_READ || rq->mq_hctx->map_index != HCTX_TYPE_DEFAULT))
 		return NULL;
 	if (op_is_flush(rq->cmd_flags) != op_is_flush(opf))
+		return NULL;
+	if (type >= HCTX_MAX_TYPES &&
+	    rq->mq_hctx != blk_mq_map_queue(opf, blk_mq_get_ctx(q), ioprio))
 		return NULL;
 	rq_list_pop(&plug->cached_rqs);
 	return rq;
@@ -3104,7 +3137,7 @@ void blk_mq_submit_bio(struct bio *bio)
 	/*
 	 * If the plug has a cached request for this queue, try to use it.
 	 */
-	rq = blk_mq_get_cached_request(plug, q, bio->bi_opf);
+	rq = blk_mq_get_cached_request(plug, q, bio->bi_opf, bio->bi_ioprio);
 
 	/*
 	 * A BIO that was released from a zone write plug has already been

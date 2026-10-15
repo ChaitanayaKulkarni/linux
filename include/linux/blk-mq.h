@@ -538,6 +538,9 @@ struct blk_mq_tag_set {
 	struct blk_mq_queue_map	map[HCTX_MAX_TYPES];
 	/* Built-in maps remain embedded for existing drivers. */
 	struct blk_mq_queue_map	*extra_maps;
+	/* Immutable optional hint-to-map lookup, owned by the driver. */
+	const u16		*class_to_map;
+	u16			nr_classes;
 	unsigned int		nr_maps;
 	unsigned int		nr_hw_queues;
 	unsigned int		queue_depth;
@@ -776,6 +779,8 @@ enum {
 
 struct request *blk_mq_alloc_request(struct request_queue *q, blk_opf_t opf,
 		blk_mq_req_flags_t flags);
+struct request *blk_mq_alloc_request_ioprio(struct request_queue *q,
+		blk_opf_t opf, blk_mq_req_flags_t flags, u16 ioprio);
 struct request *blk_mq_alloc_request_hctx(struct request_queue *q,
 		blk_opf_t opf, blk_mq_req_flags_t flags,
 		unsigned int hctx_idx);

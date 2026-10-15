@@ -347,7 +347,7 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
 	}
 
 	ctx = blk_mq_get_ctx(q);
-	hctx = blk_mq_map_queue(bio->bi_opf, ctx);
+	hctx = blk_mq_map_queue(bio->bi_opf, ctx, bio->bi_ioprio);
 	type = hctx->map_index;
 	if (list_empty_careful(blk_mq_ctx_rq_list(ctx, type)))
 		goto out_put;
