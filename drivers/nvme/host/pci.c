@@ -28,6 +28,7 @@
 #include <linux/io-64-nonatomic-hi-lo.h>
 #include <linux/sed-opal.h>
 #include <linux/sort.h>
+#include <linux/irq.h>
 
 #include "trace.h"
 #include "nvme.h"
@@ -496,8 +497,26 @@ struct nvme_iod {
 	struct nvme_sgl_desc *meta_descriptor;
 };
 
+static u8 nvme_cdl_sq_class(struct nvme_dev *dev, unsigned int qid)
+{
+	if (!dev->cdl || qid <= dev->cdl->ordinary_queues)
+		return 0;
+	return dev->cdl->classes[(qid - dev->cdl->ordinary_queues - 1) /
+		dev->cdl->queues_per_class].id;
+}
+
+static unsigned int nvme_cdl_queue_cpu(struct nvme_dev *dev, unsigned int qid)
+{
+	return cpumask_nth((qid - 1) % dev->cdl->queues_per_class,
+			   cpu_possible_mask);
+}
+
 static inline unsigned int nvme_dbbuf_size(struct nvme_dev *dev)
 {
+	if (dev->cdl)
+		return round_up((max(dev->cdl->granted_sqs,
+				     dev->cdl->granted_cqs) + 1) * 8 *
+				dev->db_stride, NVME_CTRL_PAGE_SIZE);
 	return dev->nr_allocated_queues * 8 * dev->db_stride;
 }
 
@@ -577,19 +596,21 @@ static void nvme_dbbuf_free(struct nvme_queue *nvmeq)
 	nvmeq->dbbuf_cq_ei = NULL;
 }
 
-static void nvme_dbbuf_set(struct nvme_dev *dev)
+static int nvme_dbbuf_set(struct nvme_dev *dev)
 {
 	struct nvme_command c = { };
 	unsigned int i;
+	int ret;
 
 	if (!dev->dbbuf_dbs)
-		return;
+		return dev->cdl ? -ENOMEM : 0;
 
 	c.dbbuf.opcode = nvme_admin_dbbuf;
 	c.dbbuf.prp1 = cpu_to_le64(dev->dbbuf_dbs_dma_addr);
 	c.dbbuf.prp2 = cpu_to_le64(dev->dbbuf_eis_dma_addr);
 
-	if (nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0)) {
+	ret = nvme_submit_sync_cmd(dev->ctrl.admin_q, &c, NULL, 0);
+	if (ret) {
 		dev_warn(dev->ctrl.device, "unable to set dbbuf\n");
 		/* Free memory and continue on */
 		nvme_dbbuf_dma_free(dev);
@@ -597,6 +618,7 @@ static void nvme_dbbuf_set(struct nvme_dev *dev)
 		for (i = 1; i < dev->online_queues; i++)
 			nvme_dbbuf_free(&dev->queues[i]);
 	}
+	return ret;
 }
 
 static inline int nvme_dbbuf_need_event(u16 event_idx, u16 new_idx, u16 old)
@@ -733,11 +755,36 @@ static int queue_irq_offset(struct nvme_dev *dev)
 	return 0;
 }
 
+static void nvme_cdl_map_queues(struct nvme_dev *dev,
+		struct blk_mq_tag_set *set)
+{
+	struct nvme_cdl_profile *profile = dev->cdl;
+	unsigned int slot, cpu, ordinal, offset = 0;
+
+	for (slot = 0; slot < set->nr_maps; slot++) {
+		struct blk_mq_queue_map *map = blk_mq_queue_map(set, slot);
+
+		map->nr_queues = slot == HCTX_TYPE_DEFAULT ? profile->ordinary_queues :
+			slot < HCTX_MAX_TYPES ? 0 : profile->queues_per_class;
+		map->queue_offset = offset;
+		if (!map->nr_queues)
+			continue;
+		ordinal = 0;
+		for_each_possible_cpu(cpu)
+			map->mq_map[cpu] = offset + ordinal++;
+		offset += map->nr_queues;
+	}
+}
+
 static void nvme_pci_map_queues(struct blk_mq_tag_set *set)
 {
 	struct nvme_dev *dev = to_nvme_dev(set->driver_data);
 	int i, qoff, offset;
 
+	if (dev->cdl) {
+		nvme_cdl_map_queues(dev, set);
+		return;
+	}
 	offset = queue_irq_offset(dev);
 	for (i = 0, qoff = 0; i < set->nr_maps; i++) {
 		struct blk_mq_queue_map *map = &set->map[i];
@@ -1841,6 +1888,8 @@ static int adapter_alloc_sq(struct nvme_dev *dev, u16 qid,
 	 */
 	if (ctrl->quirks & NVME_QUIRK_MEDIUM_PRIO_SQ)
 		flags |= NVME_SQ_PRIO_MEDIUM;
+	if (dev->cdl)
+		flags |= (u16)nvme_cdl_sq_class(dev, qid) << 3;
 
 	/*
 	 * Note: we (ab)use the fact that the prp fields survive if no data
@@ -3061,6 +3110,156 @@ static unsigned int nvme_max_io_queues(struct nvme_dev *dev)
 		dev->nr_poll_queues;
 }
 
+static int nvme_cdl_prepare_probe(struct nvme_dev *dev)
+{
+	struct nvme_ctrl *ctrl = &dev->ctrl;
+	struct nvme_cdl_profile *profile = dev->cdl;
+	struct nvme_cdl_caps *caps = &ctrl->cdl_caps;
+	u32 result, request;
+	unsigned int i;
+	int ret;
+
+	if (!profile)
+		return 0;
+	if (!ctrl->cdl_supported ||
+	    ctrl->quirks & (NVME_QUIRK_SHARED_TAGS | NVME_QUIRK_SINGLE_VECTOR))
+		return -EOPNOTSUPP;
+	if (profile->nr_classes > caps->bound_classes ||
+	    profile->queues_per_class > caps->per_class ||
+	    profile->nr_classes * profile->queues_per_class > caps->class_sqs ||
+	    profile->nr_queues > caps->max_sqs || profile->nr_queues > caps->max_cqs ||
+	    profile->depth - 1 > NVME_CAP_MQES(ctrl->cap))
+		return -EINVAL;
+	for (i = 0; i < profile->nr_classes; i++)
+		if (profile->classes[i].id >= caps->classes)
+			return -EINVAL;
+	request = (caps->max_sqs - 1) | ((u32)(caps->max_cqs - 1) << 16);
+	ret = nvme_set_features(ctrl, NVME_FEAT_NUM_QUEUES, request, NULL, 0, &result);
+	if (ret)
+		return ret;
+	profile->granted_sqs = (result & 0xffff) + 1;
+	profile->granted_cqs = (result >> 16) + 1;
+	if (profile->nr_queues > min(profile->granted_sqs, profile->granted_cqs))
+		return -ENOSPC;
+	ret = nvme_cdl_enable(ctrl, false);
+	if (ret)
+		return ret;
+	for (i = 0; i < profile->nr_classes; i++) {
+		struct nvme_cdl_desc desc = {
+			.duration_us = cpu_to_le32(profile->classes[i].duration_us),
+			.policy = NVME_CDL_POLICY,
+		};
+		struct nvme_cdl_desc actual;
+
+		ret = nvme_cdl_set_desc(ctrl, profile->classes[i].id, &desc);
+		if (!ret)
+			ret = nvme_cdl_get_desc(ctrl, profile->classes[i].id, 0, &actual);
+		if (ret)
+			return ret;
+		if (memcmp(&desc, &actual, sizeof(desc)))
+			return -EPROTO;
+	}
+	dev->q_depth = profile->depth;
+	ctrl->sqsize = profile->depth - 1;
+	return 0;
+}
+
+static int nvme_cdl_create_io_queues(struct nvme_dev *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	struct nvme_queue *adminq = &dev->queues[0];
+	unsigned int qid, count = dev->cdl->nr_queues;
+	int ret;
+
+	/* Recovery is deliberately outside this initial-probe implementation. */
+	if (dev->ctrl.tagset)
+		return -EOPNOTSUPP;
+	ret = nvme_setup_io_queues_trylock(dev);
+	if (ret)
+		return ret;
+	if (test_and_clear_bit(NVMEQ_ENABLED, &adminq->flags))
+		pci_free_irq(pdev, 0, adminq);
+	ret = nvme_remap_bar(dev, db_bar_size(dev, count));
+	if (ret)
+		goto unlock;
+	adminq->q_db = dev->dbs;
+	pci_free_irq_vectors(pdev);
+	ret = pci_alloc_irq_vectors(pdev, count + 1, count + 1, PCI_IRQ_MSIX);
+	if (ret < 0)
+		goto unlock;
+	dev->num_vecs = ret;
+	ret = queue_request_irq(adminq);
+	if (ret)
+		goto unlock;
+	set_bit(NVMEQ_ENABLED, &adminq->flags);
+	dev->max_qid = count;
+	dev->nr_write_queues = 0;
+	dev->nr_poll_queues = 0;
+	dev->io_queues[HCTX_TYPE_DEFAULT] = dev->cdl->ordinary_queues;
+	dev->io_queues[HCTX_TYPE_READ] = 0;
+	dev->io_queues[HCTX_TYPE_POLL] = 0;
+	mutex_unlock(&dev->shutdown_lock);
+	ret = nvme_create_io_queues(dev);
+	if (ret)
+		return ret;
+	if (dev->online_queues != count + 1)
+		return -ENOSPC;
+	for (qid = 1; qid <= count; qid++) {
+		ret = irq_set_affinity(pci_irq_vector(pdev, qid),
+				       cpumask_of(nvme_cdl_queue_cpu(dev, qid)));
+		if (ret)
+			return ret;
+	}
+	return 0;
+unlock:
+	mutex_unlock(&dev->shutdown_lock);
+	return ret;
+}
+
+static int nvme_cdl_finish_probe(struct nvme_dev *dev)
+{
+	struct nvme_cdl_profile *profile = dev->cdl;
+	bool enabled;
+	unsigned int qid, i;
+	int ret;
+
+	if (!profile)
+		return 0;
+	if (dev->tagset.nr_hw_queues != profile->nr_queues ||
+	    dev->tagset.queue_depth != profile->depth - 1)
+		return -ENOSPC;
+	for (qid = 1; qid <= profile->nr_queues; qid++) {
+		u8 cls;
+
+		ret = nvme_cdl_queue_class(&dev->ctrl, qid, &cls);
+		if (ret)
+			return ret;
+		if (cls != nvme_cdl_sq_class(dev, qid))
+			return -EPROTO;
+	}
+	dev->tagset.class_to_map = profile->class_to_map;
+	dev->tagset.nr_classes = dev->ctrl.cdl_caps.classes;
+	ret = nvme_cdl_enable(&dev->ctrl, true);
+	if (!ret)
+		ret = nvme_cdl_get_enable(&dev->ctrl, 0, &enabled);
+	if (ret)
+		return ret;
+	if (!enabled)
+		return -EPROTO;
+	WRITE_ONCE(dev->ctrl.cdl_ready, true);
+	dev_info(dev->ctrl.device,
+		 "CDL initial setup: grant %u/%u, active %u pairs, %u maps, %u vectors, depth %u, DBBUF\n",
+		 profile->granted_sqs, profile->granted_cqs, profile->nr_queues,
+		 dev->tagset.nr_maps, dev->num_vecs, profile->depth);
+	for (i = 0; i < profile->nr_classes; i++)
+		dev_info(dev->ctrl.device, "CDL class %u: %u us, %u queues, SQ %u..%u\n",
+			 profile->classes[i].id, profile->classes[i].duration_us,
+			 profile->queues_per_class,
+			 profile->ordinary_queues + i * profile->queues_per_class + 1,
+			 profile->ordinary_queues + (i + 1) * profile->queues_per_class);
+	return 0;
+}
+
 static int nvme_setup_io_queues(struct nvme_dev *dev)
 {
 	struct nvme_queue *adminq = &dev->queues[0];
@@ -3068,6 +3267,9 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	unsigned int nr_io_queues;
 	unsigned long size;
 	int result;
+
+	if (dev->cdl)
+		return nvme_cdl_create_io_queues(dev);
 
 	/*
 	 * Sample the module parameters once at reset time so that we have
@@ -3278,6 +3480,8 @@ static void nvme_delete_io_queues(struct nvme_dev *dev)
 
 static unsigned int nvme_pci_nr_maps(struct nvme_dev *dev)
 {
+	if (dev->cdl)
+		return HCTX_MAX_TYPES + dev->cdl->nr_classes;
 	if (dev->io_queues[HCTX_TYPE_POLL])
 		return 3;
 	if (dev->io_queues[HCTX_TYPE_READ])
@@ -3924,6 +4128,10 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	else
 		dev->ctrl.max_integrity_segments = 1;
 
+	result = nvme_cdl_prepare_probe(dev);
+	if (result)
+		goto out_disable;
+
 	nvme_dbbuf_dma_alloc(dev);
 
 	result = nvme_setup_host_mem(dev);
@@ -3937,13 +4145,21 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto out_disable;
 
 	if (dev->online_queues > 1) {
-		nvme_alloc_io_tag_set(&dev->ctrl, &dev->tagset, &nvme_mq_ops,
+		result = nvme_alloc_io_tag_set(&dev->ctrl, &dev->tagset, &nvme_mq_ops,
 				nvme_pci_nr_maps(dev), sizeof(struct nvme_iod));
-		nvme_dbbuf_set(dev);
+		if (result)
+			goto out_disable;
+		result = nvme_dbbuf_set(dev);
+		if (dev->cdl && result)
+			goto out_disable;
 	}
 
 	if (!dev->ctrl.tagset)
 		dev_warn(dev->ctrl.device, "IO queues not created\n");
+
+	result = nvme_cdl_finish_probe(dev);
+	if (result)
+		goto out_disable;
 
 	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_LIVE)) {
 		dev_warn(dev->ctrl.device,

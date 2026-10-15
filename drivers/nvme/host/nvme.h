@@ -413,6 +413,7 @@ struct nvme_ctrl {
 	struct nvme_cdl_caps cdl_caps;
 	bool cdl_profile;
 	bool cdl_supported;
+	bool cdl_ready;
 	int cdl_error;
 	unsigned int shutdown_timeout;
 	unsigned int kato;
