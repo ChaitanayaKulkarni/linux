@@ -415,6 +415,7 @@ const struct io_issue_def io_issue_defs[] = {
 #endif
 	},
 	[IORING_OP_URING_CMD] = {
+		.ioprio			= 1,
 		.buffer_select		= 1,
 		.needs_file		= 1,
 		.plug			= 1,
@@ -582,6 +583,7 @@ const struct io_issue_def io_issue_defs[] = {
 		.issue			= io_nop,
 	},
 	[IORING_OP_URING_CMD128] = {
+		.ioprio			= 1,
 		.buffer_select		= 1,
 		.needs_file		= 1,
 		.plug			= 1,

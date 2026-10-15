@@ -206,6 +206,7 @@ int io_uring_cmd_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 		return -EINVAL;
 
 	ioucmd->cmd_op = READ_ONCE(sqe->cmd_op);
+	ioucmd->ioprio = READ_ONCE(sqe->ioprio);
 
 	ac = io_uring_alloc_async_data(&req->ctx->cmd_cache, req);
 	if (!ac)
@@ -249,6 +250,8 @@ int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (!file->f_op->uring_cmd)
 		return -EOPNOTSUPP;
+	if (ioucmd->ioprio && !(file->f_op->fop_flags & FOP_URING_CMD_IOPRIO))
+		return -EINVAL;
 
 	ret = security_uring_cmd(ioucmd);
 	if (ret)

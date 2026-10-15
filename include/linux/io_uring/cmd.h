@@ -17,7 +17,8 @@ struct io_uring_cmd {
 	u32		cmd_op;
 	u32		flags;
 	u8		pdu[32]; /* available inline for free use */
-	u8		unused[8];
+	u16		ioprio; /* captured once at preparation, driver opt-in */
+	u8		unused[6];
 };
 
 #define io_uring_sqe128_cmd(sqe, type)	({					\
