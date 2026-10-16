@@ -300,7 +300,7 @@ MODULE_PARM_DESC(cdl_queues_per_class, "Dedicated CPU queues in each selected cl
 
 static ushort cdl_ordinary_queues = 4;
 module_param(cdl_ordinary_queues, ushort, 0444);
-MODULE_PARM_DESC(cdl_ordinary_queues, "Ordinary CPU queues on the selected controller");
+MODULE_PARM_DESC(cdl_ordinary_queues, "Ordinary queues: one shared or one per possible CPU");
 
 static ushort cdl_queue_depth = 64;
 module_param(cdl_queue_depth, ushort, 0444);
@@ -507,7 +507,10 @@ static u8 nvme_cdl_sq_class(struct nvme_dev *dev, unsigned int qid)
 
 static unsigned int nvme_cdl_queue_cpu(struct nvme_dev *dev, unsigned int qid)
 {
-	return cpumask_nth((qid - 1) % dev->cdl->queues_per_class,
+	unsigned int offset = qid <= dev->cdl->ordinary_queues ?
+		qid - 1 : qid - dev->cdl->ordinary_queues - 1;
+
+	return cpumask_nth(offset % dev->cdl->queues_per_class,
 			   cpu_possible_mask);
 }
 
@@ -771,7 +774,7 @@ static void nvme_cdl_map_queues(struct nvme_dev *dev,
 			continue;
 		ordinal = 0;
 		for_each_possible_cpu(cpu)
-			map->mq_map[cpu] = offset + ordinal++;
+			map->mq_map[cpu] = offset + ordinal++ % map->nr_queues;
 		offset += map->nr_queues;
 	}
 }
@@ -3064,7 +3067,8 @@ static int nvme_cdl_profile_init(struct nvme_dev *dev, struct pci_dev *pdev)
 		return -EINVAL;
 	/* The first fixture requires a dedicated queue for each possible CPU. */
 	if (cdl_queues_per_class != num_possible_cpus() ||
-	    cdl_ordinary_queues != num_possible_cpus() ||
+	    (cdl_ordinary_queues != 1 &&
+	     cdl_ordinary_queues != num_possible_cpus()) ||
 	    !cpumask_equal(cpu_possible_mask, cpu_online_mask))
 		return -EINVAL;
 	total = cdl_class_count * cdl_queues_per_class + cdl_ordinary_queues;
