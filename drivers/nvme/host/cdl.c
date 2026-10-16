@@ -28,10 +28,10 @@ int nvme_cdl_identify(struct nvme_ctrl *ctrl, const struct nvme_id_ctrl *id)
 	    le16_to_cpu(id->vid) != 0x8086 || memcmp(p, "CDL2FEMU", 8))
 		return 0;
 	if (get_unaligned_le16(p + 8) != 2 ||
-	    get_unaligned_le16(p + 10) != 1 ||
+	    get_unaligned_le16(p + 10) != 2 ||
 	    get_unaligned_le16(p + 12) != 64 ||
 	    p[16] != NVME_CDL_FID || p[17] != NVME_CDL_CONFIG_LOG ||
-	    p[18] != NVME_CDL_STATS_LOG || p[19] != NVME_CDL_POLICY ||
+	    p[18] || p[19] != NVME_CDL_POLICY ||
 	    get_unaligned_le32(p + 20) != 3 ||
 	    memcmp(p + 24, "TP4221V2", 8) || !cdl_zero(p + 42, 22) ||
 	    !(le32_to_cpu(id->ctratt) & BIT(28)) ||
@@ -178,12 +178,12 @@ static int cdl_log(struct nvme_ctrl *ctrl, u8 lid, u16 entry_size, u8 **image)
 	if (ret)
 		goto fail;
 	if (memcmp(p, "CDL2", 4) || get_unaligned_le16(p + 4) != 2 ||
-	    get_unaligned_le16(p + 6) || get_unaligned_le16(p + 8) != 64 ||
+	    get_unaligned_le16(p + 6) != 1 || get_unaligned_le16(p + 8) != 64 ||
 	    get_unaligned_le16(p + 10) != entry_size ||
 	    get_unaligned_le16(p + 12) != ctrl->cdl_caps.classes ||
 	    !cdl_zero(p + 14, 2) || get_unaligned_le32(p + 16) != len ||
 	    get_unaligned_le32(p + 20) & ~3U || cdl_zero(p + 32, 16) ||
-	    !cdl_zero(p + 56, 8)) {
+	    !cdl_zero(p + 48, 16)) {
 		ret = -EPROTO;
 		goto fail;
 	}
@@ -196,7 +196,7 @@ fail:
 
 int nvme_cdl_snapshot(struct nvme_ctrl *ctrl, struct nvme_cdl_snapshot *state)
 {
-	u8 *config, *stats;
+	u8 *config;
 	unsigned int c;
 	int ret;
 
@@ -205,12 +205,8 @@ int nvme_cdl_snapshot(struct nvme_ctrl *ctrl, struct nvme_cdl_snapshot *state)
 	ret = cdl_log(ctrl, NVME_CDL_CONFIG_LOG, 16, &config);
 	if (ret)
 		return ret;
-	ret = cdl_log(ctrl, NVME_CDL_STATS_LOG, 24, &stats);
-	if (ret)
-		goto out_config;
 	ret = -EPROTO;
-	if (memcmp(config + 32, stats + 32, 16) ||
-	    !cdl_zero(config + 64, 16) || !cdl_zero(stats + 64, 24))
+	if (!cdl_zero(config + 64, 16))
 		goto out;
 	memset(state, 0, sizeof(*state));
 	state->generation = get_unaligned_le64(config + 24);
@@ -218,17 +214,11 @@ int nvme_cdl_snapshot(struct nvme_ctrl *ctrl, struct nvme_cdl_snapshot *state)
 	memcpy(state->store_id, config + 32, 16);
 	for (c = 1; c < ctrl->cdl_caps.classes; c++) {
 		const u8 *ce = config + 64 + c * 16;
-		const u8 *se = stats + 64 + c * 24;
 		u32 duration = get_unaligned_le32(ce + 4);
-		u64 timed = get_unaligned_le64(se + 8);
-		u64 miss = get_unaligned_le64(se + 16);
 
 		if (ce[0] != c || ce[1] & ~3U || !cdl_zero(ce + 2, 2) ||
 		    !cdl_zero(ce + 9, 7) || !!(ce[1] & 1) != !!duration ||
-		    (duration ? ce[8] != NVME_CDL_POLICY : ce[8]) ||
-		    se[0] != c || se[1] & ~3U || !cdl_zero(se + 2, 6) ||
-		    miss > timed || !!(se[1] & 1) != (timed == U64_MAX) ||
-		    !!(se[1] & 2) != (miss == U64_MAX))
+		    (duration ? ce[8] != NVME_CDL_POLICY : ce[8]))
 			goto out;
 		state->desc[c].duration_us = cpu_to_le32(duration);
 		state->desc[c].policy = ce[8];
@@ -236,8 +226,6 @@ int nvme_cdl_snapshot(struct nvme_ctrl *ctrl, struct nvme_cdl_snapshot *state)
 	}
 	ret = 0;
 out:
-	kfree(stats);
-out_config:
 	kfree(config);
 	return ret;
 }

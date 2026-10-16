@@ -7,7 +7,6 @@
 /* Experimental FEMU identity; these are not standard NVMe allocations. */
 #define NVME_CDL_FID		0xc0
 #define NVME_CDL_CONFIG_LOG	0xc0
-#define NVME_CDL_STATS_LOG	0xc1
 #define NVME_CDL_POLICY		2
 #define NVME_CDL_MAX_CLASSES	256
 #define NVME_CDL_HEADER_SIZE	64
